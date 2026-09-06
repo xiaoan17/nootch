@@ -11,6 +11,23 @@ extension Notification.Name {
 struct NootchApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
+    init() {
+        let arguments = CommandLine.arguments
+        let dryRun = arguments.contains("--vibe-sync-dry-run")
+        guard dryRun || arguments.contains("--vibe-sync") else { return }
+        Task {
+            let report = await VibeSyncEngine.shared.sync(dryRun: dryRun)
+            print("vibe-sync \(report.status.rawValue): live \(report.liveBuckets) buckets / \(report.liveSessions) sessions,"
+                + " changed \(report.changedBuckets) / \(report.changedSessions),"
+                + " uploaded \(report.uploadedBuckets) / \(report.uploadedSessions),"
+                + " dropped \(report.droppedBuckets), pruned \(report.prunedKeys)")
+            if !report.okSources.isEmpty { print("  ok: \(report.okSources.joined(separator: ", "))") }
+            if !report.failedSources.isEmpty { print("  failed: \(report.failedSources.joined(separator: ", "))") }
+            if let error = report.error { print("  error: \(error)") }
+            exit(report.status == .synced || report.status == .dryRun ? 0 : 1)
+        }
+    }
+
     var body: some Scene {
         Settings {
             SettingsView(store: appDelegate.store ?? UsageStore())
@@ -29,6 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panelController: NotchPanelController?
     private var refreshTask: Task<Void, Never>?
     private var activityTask: Task<Void, Never>?
+    private var vibeSyncTask: Task<Void, Never>?
     private var settingsNotificationObserver: NSObjectProtocol?
     private var settingsChangeObserver: NSObjectProtocol?
     private var helloWorldWindow: NSWindow?
@@ -100,12 +118,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.store?.refreshActivity()
             }
         }
+        // First vibe-usage upload runs 60s after launch, then every 30 minutes.
+        vibeSyncTask = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .seconds(60))
+            } catch {
+                return
+            }
+            while !Task.isCancelled {
+                if AppSettings.vibeSyncEnabled {
+                    await VibeSyncEngine.shared.sync()
+                }
+                do {
+                    try await Task.sleep(for: .seconds(30 * 60))
+                } catch {
+                    return
+                }
+            }
+        }
         syncLaunchAtLogin()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         refreshTask?.cancel()
         activityTask?.cancel()
+        vibeSyncTask?.cancel()
         if let settingsNotificationObserver {
             NotificationCenter.default.removeObserver(settingsNotificationObserver)
         }
@@ -272,6 +309,7 @@ struct SettingsView: View {
     @AppStorage(AppSettings.usageDisplayModeKey) private var usageDisplayModeRaw = UsageDisplayMode.remaining.rawValue
     @AppStorage(AppSettings.showInDockKey) private var showInDock = false
     @AppStorage(AppSettings.launchAtLoginKey) private var launchAtLogin = true
+    @AppStorage(AppSettings.vibeSyncEnabledKey) private var vibeSyncEnabled = true
     @AppStorage(AppSettings.providerIconShapeKey) private var iconShapeRaw = ProviderIconShape.circle.rawValue
     @State private var restartRequired = false
     @State private var launchAtLoginError: String?
@@ -466,6 +504,20 @@ struct SettingsView: View {
                     .onChange(of: usageDisplayModeRaw) {
                         postSettingsChange()
                     }
+
+                    Divider()
+                        .padding(.horizontal, 14)
+
+                    HStack {
+                        Text("Vibe Usage 自动同步")
+                            .font(.system(size: 13))
+                        Spacer()
+                        Toggle("", isOn: $vibeSyncEnabled)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
                 }
 
                 SettingsSection(title: "Animation") {

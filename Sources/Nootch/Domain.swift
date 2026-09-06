@@ -298,6 +298,7 @@ enum AppSettings {
     static let providerIconShapeKey = "nootch.providerIconShape"
     static let themeColorKey = "nootch.themeColor"
     static let windowStyleKey = "nootch.windowStyle"
+    static let vibeSyncEnabledKey = "nootch.vibeSyncEnabled"
     @MainActor static var activeWindowStyle: WindowStyle = .liquidGlass
 
     // Keep legacy names only for importing preferences from earlier releases.
@@ -357,6 +358,11 @@ enum AppSettings {
     static var activityAnimationDuration: Double {
         let value = UserDefaults.standard.double(forKey: activityAnimationDurationKey)
         return value == 0 ? 1.6 : value
+    }
+
+    static var vibeSyncEnabled: Bool {
+        guard UserDefaults.standard.object(forKey: vibeSyncEnabledKey) != nil else { return true }
+        return UserDefaults.standard.bool(forKey: vibeSyncEnabledKey)
     }
 
     static func isProviderEnabled(_ provider: ProviderID) -> Bool {
