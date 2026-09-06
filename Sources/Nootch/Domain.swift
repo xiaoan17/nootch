@@ -150,15 +150,15 @@ enum ProviderIconShape: String, CaseIterable, Identifiable, Sendable {
 }
 
 enum ProviderID: String, Codable, CaseIterable, Identifiable, Sendable {
-    case codex, claude, openCode, openCodeGo, chatGPT, cursor, copilot, antigravity, xai, grok, groq, zai, clinePass
+    case codex, claude, openCode, openCodeGo, chatGPT, cursor, copilot, antigravity, xai, grok, groq, zai, clinePass, vibeUsage
 
     static let allCases: [Self] = [
         .codex, .claude, .openCode, .chatGPT, .cursor, .copilot,
-        .antigravity, .xai, .grok, .groq, .zai, .clinePass
+        .antigravity, .xai, .grok, .groq, .zai, .clinePass, .vibeUsage
     ]
 
     static let supported: [Self] = [
-        .codex, .claude, .openCode, .zai, .grok, .xai, .cursor, .copilot, .antigravity, .clinePass
+        .codex, .claude, .openCode, .zai, .grok, .xai, .cursor, .copilot, .antigravity, .clinePass, .vibeUsage
     ]
 
     var id: Self { self }
@@ -177,6 +177,7 @@ enum ProviderID: String, Codable, CaseIterable, Identifiable, Sendable {
         case .groq: "Groq"
         case .zai: "Z.ai"
         case .clinePass: "ClinePass"
+        case .vibeUsage: "Vibe"
         }
     }
     var icon: String {
@@ -191,6 +192,7 @@ enum ProviderID: String, Codable, CaseIterable, Identifiable, Sendable {
         case .groq: "chart.xyaxis.line"
         case .zai: "z.circle"
         case .clinePass: "circle.hexagonpath.fill"
+        case .vibeUsage: "waveform.path.ecg"
         }
     }
     var logoResource: String? {
@@ -206,6 +208,7 @@ enum ProviderID: String, Codable, CaseIterable, Identifiable, Sendable {
         case .groq: "groq.svg"
         case .zai: "zai.svg"
         case .clinePass: "cline.svg"
+        case .vibeUsage: nil
         }
     }
 }
@@ -375,6 +378,20 @@ struct CostUsageSummary: Sendable, Equatable, Codable {
     }
 }
 
+struct VibeUsageSummary: Sendable, Equatable, Codable {
+    struct ModelUsage: Sendable, Equatable, Codable {
+        let model: String
+        let costUSD: Double
+        let tokens: Int
+    }
+
+    let totalCostUSD: Double
+    let totalTokens: Int
+    let sessionsCount: Int
+    let activeSeconds: Int
+    let topModels: [ModelUsage]
+}
+
 enum AgentActivity: String, Codable, Sendable, Equatable {
     case working
     case needsAction
@@ -395,6 +412,7 @@ struct ProviderStatus: Identifiable, Sendable, Equatable, Codable {
     let error: String?
     let updatedAt: Date?
     let costUsage: CostUsageSummary?
+    let vibeUsage: VibeUsageSummary?
     let activity: AgentActivity
     var id: ProviderID { provider }
 
@@ -407,6 +425,7 @@ struct ProviderStatus: Identifiable, Sendable, Equatable, Codable {
         error: String?,
         updatedAt: Date?,
         costUsage: CostUsageSummary? = nil,
+        vibeUsage: VibeUsageSummary? = nil,
         activity: AgentActivity = .unknown)
     {
         self.provider = provider
@@ -417,11 +436,12 @@ struct ProviderStatus: Identifiable, Sendable, Equatable, Codable {
         self.error = error
         self.updatedAt = updatedAt
         self.costUsage = costUsage
+        self.vibeUsage = vibeUsage
         self.activity = activity
     }
 
     enum CodingKeys: String, CodingKey {
-        case provider, detected, source, primary, secondary, error, updatedAt, costUsage, activity
+        case provider, detected, source, primary, secondary, error, updatedAt, costUsage, vibeUsage, activity
     }
 
     init(from decoder: Decoder) throws {
@@ -435,11 +455,12 @@ struct ProviderStatus: Identifiable, Sendable, Equatable, Codable {
             error: try values.decodeIfPresent(String.self, forKey: .error),
             updatedAt: try values.decodeIfPresent(Date.self, forKey: .updatedAt),
             costUsage: try values.decodeIfPresent(CostUsageSummary.self, forKey: .costUsage),
+            vibeUsage: try values.decodeIfPresent(VibeUsageSummary.self, forKey: .vibeUsage),
             activity: try values.decodeIfPresent(AgentActivity.self, forKey: .activity) ?? .unknown)
     }
 
     func withActivity(_ activity: AgentActivity) -> Self {
-        Self(provider: provider, detected: detected, source: source, primary: primary, secondary: secondary, error: error, updatedAt: updatedAt, costUsage: costUsage, activity: activity)
+        Self(provider: provider, detected: detected, source: source, primary: primary, secondary: secondary, error: error, updatedAt: updatedAt, costUsage: costUsage, vibeUsage: vibeUsage, activity: activity)
     }
 
     static func unavailable(_ provider: ProviderID, detected: Bool, source: String? = nil, error: String? = nil) -> Self {

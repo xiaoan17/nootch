@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 struct CodexAdapter: ProviderAdapter {
     let provider: ProviderID = .codex
@@ -866,4 +867,129 @@ struct ClinePassAdapter: ProviderAdapter {
     }
 
     private static func apiKey() -> String? { ProviderSecret.value(environmentNames: ["CLINE_API_KEY", "CLINEPASS_API_KEY"], keychainAccount: "clinepass.apiKey") }
+}
+
+struct VibeUsageConfig: Sendable, Equatable {
+    let apiKey: String
+    let apiURL: String
+}
+
+struct VibeUsageAdapter: ProviderAdapter {
+    let provider: ProviderID = .vibeUsage
+
+    static let defaultAPIURL = "https://vibecafe.ai"
+    static let defaultConfigPath = NSString(string: "~/.vibe-usage/config.json").expandingTildeInPath
+
+    private let configPath: String
+    private let dataLoader: (@Sendable (URLRequest) async throws -> (Data, URLResponse))?
+
+    init(
+        configPath: String = VibeUsageAdapter.defaultConfigPath,
+        dataLoader: (@Sendable (URLRequest) async throws -> (Data, URLResponse))? = nil)
+    {
+        self.configPath = configPath
+        self.dataLoader = dataLoader
+    }
+
+    func detect() async -> DetectionResult {
+        guard Self.loadConfig(at: configPath) != nil else { return DetectionResult(detected: false, source: nil) }
+        return DetectionResult(detected: true, source: "vibecafe.ai")
+    }
+
+    func fetch() async -> ProviderStatus {
+        guard let config = Self.loadConfig(at: configPath) else {
+            return .unavailable(.vibeUsage, detected: false)
+        }
+        do {
+            guard let url = URL(string: "\(config.apiURL)/api/usage?days=1") else {
+                throw AdditionalProviderError.message("Invalid Vibe Usage endpoint in ~/.vibe-usage/config.json.")
+            }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 15
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.setValue("Bearer \(config.apiKey)", forHTTPHeaderField: "Authorization")
+            let (data, response) = try await load(request)
+            guard let http = response as? HTTPURLResponse else { throw AdditionalProviderError.message("Invalid Vibe Usage response.") }
+            guard http.statusCode == 200 else { throw httpError("Vibe Usage", status: http.statusCode) }
+            let usage = try JSONDecoder().decode(UsageResponse.self, from: data)
+            return ProviderStatus(
+                provider: .vibeUsage, detected: true, source: "vibecafe.ai",
+                primary: nil, secondary: nil, error: nil, updatedAt: Date(),
+                vibeUsage: Self.summarize(usage))
+        } catch is CancellationError {
+            return .unavailable(.vibeUsage, detected: true, source: "vibecafe.ai", error: "Refresh cancelled")
+        } catch {
+            return statusError(.vibeUsage, source: "vibecafe.ai", error: error)
+        }
+    }
+
+    private func load(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        if let dataLoader { return try await dataLoader(request) }
+        return try await URLSession.shared.data(for: request)
+    }
+
+    struct UsageResponse: Decodable {
+        let buckets: [Bucket]
+        let sessions: [Session]
+
+        struct Bucket: Decodable {
+            let model: String?
+            let totalTokens: Int?
+            let estimatedCost: Double?
+        }
+
+        struct Session: Decodable {
+            let activeSeconds: Int?
+        }
+    }
+
+    static func summarize(_ response: UsageResponse) -> VibeUsageSummary {
+        let totalCost = response.buckets.reduce(0) { $0 + ($1.estimatedCost ?? 0) }
+        let totalTokens = response.buckets.reduce(0) { $0 + ($1.totalTokens ?? 0) }
+        let activeSeconds = response.sessions.reduce(0) { $0 + ($1.activeSeconds ?? 0) }
+        var byModel: [String: (cost: Double, tokens: Int)] = [:]
+        for bucket in response.buckets {
+            let model = bucket.model ?? "unknown"
+            let entry = byModel[model] ?? (0, 0)
+            byModel[model] = (entry.cost + (bucket.estimatedCost ?? 0), entry.tokens + (bucket.totalTokens ?? 0))
+        }
+        let topModels = byModel
+            .sorted { lhs, rhs in
+                if lhs.value.cost != rhs.value.cost { return lhs.value.cost > rhs.value.cost }
+                if lhs.value.tokens != rhs.value.tokens { return lhs.value.tokens > rhs.value.tokens }
+                return lhs.key < rhs.key
+            }
+            .prefix(5)
+            .map { VibeUsageSummary.ModelUsage(model: $0.key, costUSD: $0.value.cost, tokens: $0.value.tokens) }
+        return VibeUsageSummary(
+            totalCostUSD: totalCost, totalTokens: totalTokens,
+            sessionsCount: response.sessions.count, activeSeconds: activeSeconds,
+            topModels: topModels)
+    }
+
+    static func parseConfig(_ data: Data) -> VibeUsageConfig? {
+        struct ConfigFile: Decodable { let apiKey: String?; let apiUrl: String? }
+        guard let file = try? JSONDecoder().decode(ConfigFile.self, from: data) else { return nil }
+        let key = (file.apiKey ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return nil }
+        let base = (file.apiUrl ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return VibeUsageConfig(apiKey: key, apiURL: base.isEmpty ? defaultAPIURL : base)
+    }
+
+    // Quota refreshes run every 30s; the config file only changes when the user
+    // re-runs the vibe-usage CLI, so re-read it only when its mtime moves.
+    private static let configCache = Mutex<[String: (modified: TimeInterval, config: VibeUsageConfig?)]>([:])
+
+    static func loadConfig(at path: String) -> VibeUsageConfig? {
+        let expanded = NSString(string: path).expandingTildeInPath
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: expanded),
+              let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970
+        else { return nil }
+        if let cached = configCache.withLock({ $0[expanded] }), cached.modified == modified {
+            return cached.config
+        }
+        let config = (try? Data(contentsOf: URL(fileURLWithPath: expanded))).flatMap(parseConfig)
+        configCache.withLock { $0[expanded] = (modified, config) }
+        return config
+    }
 }

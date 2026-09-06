@@ -92,8 +92,9 @@ final class UsageStore {
                 if fresh.error != nil,
                    fresh.primary == nil,
                    fresh.secondary == nil,
+                   fresh.vibeUsage == nil,
                    let previous = previousByProvider[fresh.provider],
-                   previous.primary != nil || previous.secondary != nil
+                   previous.primary != nil || previous.secondary != nil || previous.vibeUsage != nil
                 {
                     status = ProviderStatus(
                         provider: fresh.provider,
@@ -104,6 +105,7 @@ final class UsageStore {
                         error: fresh.error,
                         updatedAt: previous.updatedAt,
                         costUsage: previous.costUsage,
+                        vibeUsage: previous.vibeUsage,
                         activity: previous.activity)
                 } else {
                     status = fresh

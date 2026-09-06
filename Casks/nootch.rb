@@ -1,11 +1,11 @@
 cask "nootch" do
-  version "1.0.4"
-  sha256 "025dc18e73d0ad584953d8f1ff68b7c475eb6b20f211ae1f5f636f4acb09257d"
+  version "1.1.0"
+  sha256 "145f890397cd46000a7ec08584e4425a2660cf830b5c0f4e7e34cd755b415450"
 
-  url "https://github.com/DeepanshuMishraa/nootch/releases/download/v#{version}/nootch-#{version}.dmg"
+  url "https://github.com/xiaoan17/nootch/releases/download/v#{version}/nootch-#{version}.dmg"
   name "nootch"
-  desc "AI provider usage and agent activity overlay"
-  homepage "https://github.com/DeepanshuMishraa/nootch"
+  desc "Today's AI coding usage overlay, powered by vibecafe.ai (fork of DeepanshuMishraa/nootch)"
+  homepage "https://github.com/xiaoan17/nootch"
 
   depends_on arch: :arm64
   depends_on macos: :sequoia

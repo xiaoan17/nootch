@@ -1544,8 +1544,20 @@ struct ProviderRailItem: View {
     }
 
     private var percentageLabel: String {
+        if status.provider == .vibeUsage {
+            guard let usage = status.vibeUsage else { return "—" }
+            return Self.compactCost(usage.totalCostUSD)
+        }
         guard status.primary != nil else { return "—" }
         return "\(Int(displayedPercent.rounded()))%"
+    }
+
+    private static func compactCost(_ cost: Double) -> String {
+        switch cost {
+        case 100...: String(format: "$%.0f", cost)
+        case 10...: String(format: "$%.1f", cost)
+        default: String(format: "$%.2f", cost)
+        }
     }
 
     private var gaugeColor: Color {
@@ -1560,7 +1572,8 @@ struct ProviderRailItem: View {
                 trackView
 
                 // When STOPPED/IDLE: Display standard quota gauge
-                if !status.activity.isWorking {
+                // (Vibe Usage has no quota window, so it keeps the bare track).
+                if !status.activity.isWorking, status.provider != .vibeUsage {
                     gaugeFillView
                 }
 
@@ -1772,29 +1785,31 @@ struct DetailPopoverCard: View {
             }
 
             // Primary Window: "Current session"
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Current session")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Color.white.opacity(0.85))
+            if status.provider != .vibeUsage {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Current session")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.85))
 
-                // Horizontal Progress Bar
-                CustomProgressBar(
-                    value: displayedPercent(for: primaryWindow),
-                    gradient: primaryWindow?.gradient ?? defaultGradient
-                )
+                    // Horizontal Progress Bar
+                    CustomProgressBar(
+                        value: displayedPercent(for: primaryWindow),
+                        gradient: primaryWindow?.gradient ?? defaultGradient
+                    )
 
-                // Sub-labels: "73% Remaining" and "Resets Thu 12:00 AM"
-                HStack {
-                    Text("\(Int(displayedPercent(for: primaryWindow).rounded()))% \(usageLabel)")
-                        .font(.system(size: 11.5, weight: .regular))
-                        .foregroundStyle(Color.white.opacity(0.6))
-
-                    Spacer()
-
-                    if let resetText = primaryWindow?.formattedAbsoluteReset {
-                        Text(resetText)
+                    // Sub-labels: "73% Remaining" and "Resets Thu 12:00 AM"
+                    HStack {
+                        Text("\(Int(displayedPercent(for: primaryWindow).rounded()))% \(usageLabel)")
                             .font(.system(size: 11.5, weight: .regular))
-                            .foregroundStyle(Color.white.opacity(0.48))
+                            .foregroundStyle(Color.white.opacity(0.6))
+
+                        Spacer()
+
+                        if let resetText = primaryWindow?.formattedAbsoluteReset {
+                            Text(resetText)
+                                .font(.system(size: 11.5, weight: .regular))
+                                .foregroundStyle(Color.white.opacity(0.48))
+                        }
                     }
                 }
             }
@@ -1828,6 +1843,8 @@ struct DetailPopoverCard: View {
             }
 
             costUsageSection
+
+            vibeUsageSection
 
             if let error = status.error {
                 Text(error)
@@ -1886,6 +1903,55 @@ struct DetailPopoverCard: View {
         } else {
             EmptyView()
         }
+    }
+
+    @ViewBuilder
+    private var vibeUsageSection: some View {
+        if let usage = status.vibeUsage {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Today's usage")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.85))
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack {
+                        Text("Cost")
+                        Spacer()
+                        Text(String(format: "$%.2f", usage.totalCostUSD))
+                    }
+                    HStack {
+                        Text("Tokens")
+                        Spacer()
+                        Text(Self.compactTokenCount(usage.totalTokens))
+                    }
+                    HStack {
+                        Text("Sessions")
+                        Spacer()
+                        Text("\(usage.sessionsCount) · \(Self.compactDuration(usage.activeSeconds))")
+                    }
+                    ForEach(usage.topModels, id: \.model) { entry in
+                        HStack(spacing: 8) {
+                            Text(entry.model)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            Text("\(Self.compactTokenCount(entry.tokens)) · \(String(format: "$%.2f", entry.costUSD))")
+                        }
+                    }
+                }
+                .foregroundStyle(Color.white.opacity(0.6))
+                .font(.system(size: 11.5, weight: .regular))
+            }
+        } else {
+            EmptyView()
+        }
+    }
+
+    private static func compactDuration(_ seconds: Int) -> String {
+        if seconds < 60 { return "\(seconds)s" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes)m" }
+        let hours = minutes / 60
+        return minutes % 60 > 0 ? "\(hours)h \(minutes % 60)m" : "\(hours)h"
     }
 
     private static func tokenAndCost(tokens: Int?, cost: Double?) -> String {

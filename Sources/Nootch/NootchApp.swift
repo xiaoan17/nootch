@@ -595,10 +595,9 @@ struct SettingsView: View {
                 }
 
                 SettingsSection(title: "Providers") {
-                    let supported = ProviderID.supported
+                    let supported = ProviderDiscovery.defaultAdapters.map(\.provider)
                     ForEach(Array(supported.enumerated()), id: \.element.id) { index, provider in
-                        let isInstalled = (store.statuses.first { $0.provider == provider }?.detected ?? false)
-                            || (provider == .openCode && OpenCodeAdapter.isInstalled)
+                        let isInstalled = store.statuses.first { $0.provider == provider }?.detected ?? false
                         VStack(spacing: 0) {
                             HStack(spacing: 12) {
                                 ProviderLogo(provider: provider, size: 22)
