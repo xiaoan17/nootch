@@ -17,6 +17,15 @@ private let vibeFixtureJSON = """
 }
 """
 
+/// A fixed "now" that lands right after the fixture's last event, in UTC so the
+/// calendar-day math is timezone-stable for CI.
+private var fixtureCalendar: Calendar {
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = TimeZone(identifier: "UTC")!
+    return cal
+}
+private let fixtureNow = ISO8601DateFormatter().date(from: "2026-09-05T10:00:00Z")!
+
 private func vibeConfigFile(contents: String) throws -> String {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -25,9 +34,9 @@ private func vibeConfigFile(contents: String) throws -> String {
     return url.path
 }
 
-@Test func vibeSummaryAggregatesBucketsAndSessions() throws {
+@Test func vibeSummaryAggregatesBucketsAndSessionsForToday() throws {
     let response = try JSONDecoder().decode(VibeUsageAdapter.UsageResponse.self, from: Data(vibeFixtureJSON.utf8))
-    let summary = VibeUsageAdapter.summarize(response)
+    let summary = VibeUsageAdapter.summarize(response, window: .today, now: fixtureNow, calendar: fixtureCalendar)
     #expect(abs(summary.totalCostUSD - 5.609867) < 1e-9)
     #expect(summary.totalTokens == 228_430)
     #expect(summary.sessionsCount == 2)
@@ -39,13 +48,53 @@ private func vibeConfigFile(contents: String) throws -> String {
     #expect(summary.topModels[1].model == "gpt-5")
 }
 
+@Test func vibeSummaryDropsPreviousDaysWhenWindowIsToday() throws {
+    let response = try JSONDecoder().decode(VibeUsageAdapter.UsageResponse.self, from: Data(vibeFixtureJSON.utf8))
+    // Pretend "now" is the next day at noon UTC; fixture buckets from 2026-09-05
+    // should all be filtered out.
+    let nextDay = ISO8601DateFormatter().date(from: "2026-09-06T12:00:00Z")!
+    let summary = VibeUsageAdapter.summarize(response, window: .today, now: nextDay, calendar: fixtureCalendar)
+    #expect(summary.totalCostUSD == 0)
+    #expect(summary.totalTokens == 0)
+    #expect(summary.sessionsCount == 0)
+    #expect(summary.topModels.isEmpty)
+}
+
+@Test func vibeSummaryRollingDayIncludesLast24Hours() throws {
+    let response = try JSONDecoder().decode(VibeUsageAdapter.UsageResponse.self, from: Data(vibeFixtureJSON.utf8))
+    // 20 hours after the last fixture event — still inside the 24h rolling window.
+    let now = ISO8601DateFormatter().date(from: "2026-09-06T05:00:00Z")!
+    let summary = VibeUsageAdapter.summarize(response, window: .day, now: now, calendar: fixtureCalendar)
+    #expect(summary.totalTokens == 228_430)
+    #expect(summary.sessionsCount == 2)
+}
+
+@Test func vibeSummaryWeekAndMonthIncludeOlderFixture() throws {
+    let response = try JSONDecoder().decode(VibeUsageAdapter.UsageResponse.self, from: Data(vibeFixtureJSON.utf8))
+    // 3 days after fixture — outside 24h but inside 7d and 30d.
+    let now = ISO8601DateFormatter().date(from: "2026-09-08T09:00:00Z")!
+    let week = VibeUsageAdapter.summarize(response, window: .week, now: now, calendar: fixtureCalendar)
+    #expect(week.totalTokens == 228_430)
+    #expect(week.sessionsCount == 2)
+    let month = VibeUsageAdapter.summarize(response, window: .month, now: now, calendar: fixtureCalendar)
+    #expect(month.totalTokens == 228_430)
+    #expect(month.sessionsCount == 2)
+    let day = VibeUsageAdapter.summarize(response, window: .day, now: now, calendar: fixtureCalendar)
+    #expect(day.totalTokens == 0)
+    #expect(day.sessionsCount == 0)
+}
+
 @Test func vibeSummaryLimitsTopModelsToFiveByCost() {
+    // Give every fixture bucket the same recent timestamp so the window filter
+    // is a no-op and we're only exercising the top-N selection logic.
+    let now = Date()
+    let stamp = ISO8601DateFormatter().string(from: now)
     let buckets = (0..<7).map { index in
-        "{\"model\":\"model-\(index)\",\"totalTokens\":\(100 - index),\"estimatedCost\":\(Double(index))}"
+        "{\"model\":\"model-\(index)\",\"totalTokens\":\(100 - index),\"estimatedCost\":\(Double(index)),\"bucketStart\":\"\(stamp)\"}"
     }.joined(separator: ",")
     let json = "{\"buckets\":[\(buckets)],\"sessions\":[],\"hasAnyData\":true}"
     let response = try! JSONDecoder().decode(VibeUsageAdapter.UsageResponse.self, from: Data(json.utf8))
-    let summary = VibeUsageAdapter.summarize(response)
+    let summary = VibeUsageAdapter.summarize(response, window: .month, now: now)
     #expect(summary.topModels.count == 5)
     #expect(summary.topModels.map(\.model) == ["model-6", "model-5", "model-4", "model-3", "model-2"])
     #expect(summary.sessionsCount == 0)
@@ -77,23 +126,29 @@ private func vibeConfigFile(contents: String) throws -> String {
     #expect(detection.source == "vibecafe.ai")
 }
 
-@Test func vibeFetchAggregatesTodayUsage() async throws {
-    let path = try vibeConfigFile(contents: #"{"apiKey":"vbu_test123"}"#)
-    let adapter = VibeUsageAdapter(configPath: path) { request in
-        #expect(request.url?.absoluteString == "https://vibecafe.ai/api/usage?days=1")
-        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer vbu_test123")
-        let response = HTTPURLResponse(url: try #require(request.url), statusCode: 200, httpVersion: nil, headerFields: nil)!
-        return (Data(vibeFixtureJSON.utf8), response)
+@Test func vibeFetchRequestsDaysMatchingWindow() async throws {
+    // Verify each window sends the expected days=N. We can't touch AppSettings
+    // (main-actor global) directly from a background test easily, so we run the
+    // request with each configured window in sequence via UserDefaults.
+    let expectedDays: [(VibeUsageWindow, String)] = [
+        (.today, "1"), (.day, "1"), (.week, "7"), (.month, "30")
+    ]
+    for (window, days) in expectedDays {
+        UserDefaults.standard.set(window.rawValue, forKey: AppSettings.vibeUsageWindowKey)
+        let path = try vibeConfigFile(contents: #"{"apiKey":"vbu_test123"}"#)
+        let adapter = VibeUsageAdapter(configPath: path) { request in
+            #expect(request.url?.absoluteString == "https://vibecafe.ai/api/usage?days=\(days)")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer vbu_test123")
+            let response = HTTPURLResponse(url: try #require(request.url), statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (Data(vibeFixtureJSON.utf8), response)
+        }
+        let status = await adapter.fetch()
+        #expect(status.provider == .vibeUsage)
+        #expect(status.detected)
+        #expect(status.error == nil)
+        #expect(status.primary == nil)
     }
-    let status = await adapter.fetch()
-    #expect(status.provider == .vibeUsage)
-    #expect(status.detected)
-    #expect(status.error == nil)
-    #expect(status.primary == nil)
-    let usage = try #require(status.vibeUsage)
-    #expect(usage.totalTokens == 228_430)
-    #expect(usage.sessionsCount == 2)
-    #expect(usage.topModels.first?.model == "claude-opus-4-7")
+    UserDefaults.standard.removeObject(forKey: AppSettings.vibeUsageWindowKey)
 }
 
 @Test func vibeFetchReportsInvalidKeyOn401() async throws {

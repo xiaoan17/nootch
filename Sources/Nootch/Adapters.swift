@@ -900,8 +900,9 @@ struct VibeUsageAdapter: ProviderAdapter {
         guard let config = Self.loadConfig(at: configPath) else {
             return .unavailable(.vibeUsage, detected: false)
         }
+        let window = AppSettings.vibeUsageWindow
         do {
-            guard let url = URL(string: "\(config.apiURL)/api/usage?days=1") else {
+            guard let url = URL(string: "\(config.apiURL)/api/usage?days=\(window.apiDays)") else {
                 throw AdditionalProviderError.message("Invalid Vibe Usage endpoint in ~/.vibe-usage/config.json.")
             }
             var request = URLRequest(url: url)
@@ -915,7 +916,7 @@ struct VibeUsageAdapter: ProviderAdapter {
             return ProviderStatus(
                 provider: .vibeUsage, detected: true, source: "vibecafe.ai",
                 primary: nil, secondary: nil, error: nil, updatedAt: Date(),
-                vibeUsage: Self.summarize(usage))
+                vibeUsage: Self.summarize(usage, window: window))
         } catch is CancellationError {
             return .unavailable(.vibeUsage, detected: true, source: "vibecafe.ai", error: "Refresh cancelled")
         } catch {
@@ -936,19 +937,65 @@ struct VibeUsageAdapter: ProviderAdapter {
             let model: String?
             let totalTokens: Int?
             let estimatedCost: Double?
+            let bucketStart: String?
         }
 
         struct Session: Decodable {
             let activeSeconds: Int?
+            let firstMessageAt: String?
+            let lastMessageAt: String?
         }
     }
 
-    static func summarize(_ response: UsageResponse) -> VibeUsageSummary {
-        let totalCost = response.buckets.reduce(0) { $0 + ($1.estimatedCost ?? 0) }
-        let totalTokens = response.buckets.reduce(0) { $0 + ($1.totalTokens ?? 0) }
-        let activeSeconds = response.sessions.reduce(0) { $0 + ($1.activeSeconds ?? 0) }
+    // ISO 8601 with fractional seconds — the shape vibecafe.ai emits
+    // (e.g. "2026-09-07T06:00:00.000Z"). Cached because summarize() is called on
+    // every 30-min refresh over dozens of buckets. `ISO8601DateFormatter` is
+    // documented thread-safe for parsing but the type isn't marked Sendable, so
+    // we opt out of the concurrency check explicitly.
+    nonisolated(unsafe) private static let iso8601Formatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    nonisolated(unsafe) private static let iso8601FormatterNoFraction: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    static func parseTimestamp(_ raw: String?) -> Date? {
+        guard let raw, !raw.isEmpty else { return nil }
+        return iso8601Formatter.date(from: raw) ?? iso8601FormatterNoFraction.date(from: raw)
+    }
+
+    /// Filter the response to buckets/sessions whose timestamps fall inside the
+    /// requested window's half-open `[start, end)` interval, then aggregate.
+    /// The vibecafe.ai `/api/usage?days=N` endpoint returns a rolling window;
+    /// we narrow it locally so the picker in Settings ("Today / 24h / Week /
+    /// Month") is authoritative regardless of what the server returns.
+    static func summarize(
+        _ response: UsageResponse,
+        window: VibeUsageWindow = AppSettings.vibeUsageWindow,
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> VibeUsageSummary {
+        let (start, end) = window.range(now: now, calendar: calendar)
+        let buckets = response.buckets.filter { bucket in
+            guard let ts = parseTimestamp(bucket.bucketStart) else { return false }
+            return ts >= start && ts < end
+        }
+        let sessions = response.sessions.filter { session in
+            // A session counts when it has any activity inside the window; the
+            // most recent message drives inclusion (fallback to first message).
+            guard let ts = parseTimestamp(session.lastMessageAt)
+                ?? parseTimestamp(session.firstMessageAt) else { return false }
+            return ts >= start && ts < end
+        }
+        let totalCost = buckets.reduce(0) { $0 + ($1.estimatedCost ?? 0) }
+        let totalTokens = buckets.reduce(0) { $0 + ($1.totalTokens ?? 0) }
+        let activeSeconds = sessions.reduce(0) { $0 + ($1.activeSeconds ?? 0) }
         var byModel: [String: (cost: Double, tokens: Int)] = [:]
-        for bucket in response.buckets {
+        for bucket in buckets {
             let model = bucket.model ?? "unknown"
             let entry = byModel[model] ?? (0, 0)
             byModel[model] = (entry.cost + (bucket.estimatedCost ?? 0), entry.tokens + (bucket.totalTokens ?? 0))
@@ -963,7 +1010,7 @@ struct VibeUsageAdapter: ProviderAdapter {
             .map { VibeUsageSummary.ModelUsage(model: $0.key, costUSD: $0.value.cost, tokens: $0.value.tokens) }
         return VibeUsageSummary(
             totalCostUSD: totalCost, totalTokens: totalTokens,
-            sessionsCount: response.sessions.count, activeSeconds: activeSeconds,
+            sessionsCount: sessions.count, activeSeconds: activeSeconds,
             topModels: topModels)
     }
 

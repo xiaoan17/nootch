@@ -55,7 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppSettings.configure()
         applyDockVisibility()
-        if let iconURL = Bundle.module.url(forResource: "NootchIcon", withExtension: "png"),
+        if let iconURL = Bundle.nootchResources.url(forResource: "NootchIcon", withExtension: "png"),
            let icon = NSImage(contentsOf: iconURL) {
             icon.isTemplate = false
             NSApp.applicationIconImage = icon
@@ -307,6 +307,7 @@ struct SettingsView: View {
     @AppStorage(AppSettings.activityAnimationDurationKey) private var activityAnimationDuration = 1.6
     @AppStorage(AppSettings.overlayDisplayModeKey) private var displayModeRaw = OverlayDisplayMode.hover.rawValue
     @AppStorage(AppSettings.usageDisplayModeKey) private var usageDisplayModeRaw = UsageDisplayMode.remaining.rawValue
+    @AppStorage(AppSettings.vibeUsageWindowKey) private var vibeUsageWindowRaw = VibeUsageWindow.today.rawValue
     @AppStorage(AppSettings.showInDockKey) private var showInDock = false
     @AppStorage(AppSettings.launchAtLoginKey) private var launchAtLogin = true
     @AppStorage(AppSettings.vibeSyncEnabledKey) private var vibeSyncEnabled = true
@@ -503,6 +504,25 @@ struct SettingsView: View {
                     .padding(.vertical, 10)
                     .onChange(of: usageDisplayModeRaw) {
                         postSettingsChange()
+                    }
+
+                    Divider()
+                        .padding(.horizontal, 14)
+
+                    Picker("Cost window", selection: $vibeUsageWindowRaw) {
+                        ForEach(VibeUsageWindow.allCases) { window in
+                            Text(window.title).tag(window.rawValue)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .onChange(of: vibeUsageWindowRaw) {
+                        // Panel needs to re-render the window label, and the
+                        // store needs to re-fetch so numbers reflect the new
+                        // range immediately instead of waiting 30 minutes.
+                        postSettingsChange(rebuildSettings: false)
+                        store.refresh()
                     }
 
                     Divider()

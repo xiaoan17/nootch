@@ -115,6 +115,62 @@ enum UsageDisplayMode: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// Time window for the Vibe Usage cost card. `today` is a calendar day in the
+/// user's local timezone; the others are rolling windows anchored on "now".
+enum VibeUsageWindow: String, CaseIterable, Identifiable, Sendable {
+    case today
+    case day    // rolling last 24 hours
+    case week   // rolling last 7 days
+    case month  // rolling last 30 days
+
+    var id: Self { self }
+
+    /// Short label shown in the settings picker.
+    var title: String {
+        switch self {
+        case .today: "Today"
+        case .day: "24h"
+        case .week: "Week"
+        case .month: "Month"
+        }
+    }
+
+    /// Chinese label used inline in the hover panel.
+    var localizedShort: String {
+        switch self {
+        case .today: "今日"
+        case .day: "24h"
+        case .week: "近 7 天"
+        case .month: "近 30 天"
+        }
+    }
+
+    /// `days=N` parameter passed to `/api/usage`. Chosen to always cover the
+    /// window with a small margin; local filtering narrows it precisely.
+    var apiDays: Int {
+        switch self {
+        case .today, .day: 1
+        case .week: 7
+        case .month: 30
+        }
+    }
+
+    /// Half-open interval `[start, end)` that a bucket / session timestamp must
+    /// fall into to be counted. Computed against `now` in the caller's calendar.
+    func range(now: Date = Date(), calendar: Calendar = .current) -> (start: Date, end: Date) {
+        switch self {
+        case .today:
+            return (calendar.startOfDay(for: now), now)
+        case .day:
+            return (now.addingTimeInterval(-24 * 3600), now)
+        case .week:
+            return (now.addingTimeInterval(-7 * 24 * 3600), now)
+        case .month:
+            return (now.addingTimeInterval(-30 * 24 * 3600), now)
+        }
+    }
+}
+
 enum OverlayDisplayMode: String, CaseIterable, Identifiable, Sendable {
     case alwaysExpanded
     case hover
@@ -293,6 +349,7 @@ enum AppSettings {
     static let activityAnimationDurationKey = "nootch.activityAnimationDuration"
     static let overlayDisplayModeKey = "nootch.overlayDisplayMode"
     static let usageDisplayModeKey = "nootch.usageDisplayMode"
+    static let vibeUsageWindowKey = "nootch.vibeUsageWindow"
     static let showInDockKey = "nootch.showInDock"
     static let launchAtLoginKey = "nootch.launchAtLogin"
     static let providerIconShapeKey = "nootch.providerIconShape"
@@ -344,6 +401,10 @@ enum AppSettings {
 
     static var overlayDisplayMode: OverlayDisplayMode {
         OverlayDisplayMode(rawValue: UserDefaults.standard.string(forKey: overlayDisplayModeKey) ?? "") ?? .hover
+    }
+
+    static var vibeUsageWindow: VibeUsageWindow {
+        VibeUsageWindow(rawValue: UserDefaults.standard.string(forKey: vibeUsageWindowKey) ?? "") ?? .today
     }
 
     static var providerIconShape: ProviderIconShape {

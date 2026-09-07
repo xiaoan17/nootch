@@ -1909,7 +1909,7 @@ struct DetailPopoverCard: View {
     private var vibeUsageSection: some View {
         if let usage = status.vibeUsage {
             VStack(alignment: .leading, spacing: 5) {
-                Text("Today's usage")
+                Text("\(AppSettings.vibeUsageWindow.localizedShort)用量")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Color.white.opacity(0.85))
                 VStack(alignment: .leading, spacing: 5) {
