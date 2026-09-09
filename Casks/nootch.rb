@@ -1,6 +1,6 @@
 cask "nootch" do
-  version "1.3.2"
-  sha256 "46bd7de59440fb6b4407877347091ee49f1a88ac2a495019361e81363f1e8d78"
+  version "1.3.3"
+  sha256 "d735a9da714f17505b5e848639264e15bd26951da5848c716831802cd9aa0eaf"
 
   url "https://github.com/xiaoan17/nootch/releases/download/v#{version}/nootch-#{version}.dmg"
   name "nootch"

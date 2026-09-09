@@ -1950,13 +1950,11 @@ struct DetailPopoverCard: View {
             ThemedGlass(shape: shape)
                 .overlay(currentTheme.color.opacity(0.14).clipShape(shape))
                 .overlay(shape.stroke(Color.white.opacity(0.12), lineWidth: 1))
-                .shadow(color: Color.black.opacity(0.65), radius: 24, y: verticalPointerOnTop ? 10 : -10)
         } else {
             let shape = PopoverCalloutShape(pointerY: pointerY, pointerOnLeft: pointerOnLeft)
             ThemedGlass(shape: shape)
                 .overlay(currentTheme.color.opacity(0.14).clipShape(shape))
                 .overlay(shape.stroke(Color.white.opacity(0.12), lineWidth: 1))
-                .shadow(color: Color.black.opacity(0.65), radius: 24, x: pointerOnLeft ? 8 : -8, y: 10)
         }
     }
 
