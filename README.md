@@ -79,6 +79,7 @@ brew install --cask xiaoan17/nootch/nootch
 - 把鼠标移到**屏幕右缘 / 左缘**（可在设置里改到底部居中），面板就会滑出
 - 圆点上直接显示**当前窗口费用**（如 `$82.2`），窗口可在设置里切换（默认今日，可选 24h / 近 7 天 / 近 30 天）
 - **悬停圆点**展开详情卡：总费用、总 tokens、session 数、活跃时长、Top 5 模型费用明细
+- **直接按住面板拖动**即可调整位置：左右边缘模式上下移动，底部模式左右移动；松手后自动保存
 - 设置窗口里可调整位置、外观、主题色、**费用窗口范围**等
 
 ### 保持数据新鲜
@@ -98,9 +99,11 @@ v1.2.0 起无需任何额外组件——nootch 运行期间每 30 分钟自动�
 git clone https://github.com/xiaoan17/nootch.git
 cd nootch
 swift run nootch          # 直接运行
-swift test                # 跑测试
+Tools/test.sh             # 跑测试（兼容独立 Command Line Tools 的 Swift Testing 路径）
 packaging/build-app.sh    # 打出 .app 和 DMG（在 dist/）
 ```
+
+`Tools/test.sh` 会检测当前开发工具目录，为部分独立 Command Line Tools 版本补上 Swift Testing 的框架和运行库搜索路径；不修改系统工具链。可以透传测试参数，例如 `Tools/test.sh --filter VibeUsage`。完整 Xcode 等其他环境会直接使用 `swift test`。
 
 ## 致谢 / References
 

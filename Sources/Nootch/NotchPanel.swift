@@ -43,6 +43,7 @@ struct GlassMaterialView: NSViewRepresentable {
 
 struct ThemedGlass<S: Shape>: View {
     let shape: S
+    var edgePanel = false
     @AppStorage(AppSettings.themeColorKey) private var themeRaw = ThemeColor.red.rawValue
 
     private var currentTheme: ThemeColor {
@@ -50,7 +51,14 @@ struct ThemedGlass<S: Shape>: View {
     }
 
     var body: some View {
-        if #available(macOS 26.0, *), AppSettings.activeWindowStyle == .liquidGlass {
+        if edgePanel, AppSettings.activeWindowStyle != .solid {
+            // Native Liquid Glass adds an outer dark lens rim even without a
+            // SwiftUI shadow. Edge rails use a clipped material instead.
+            shape.fill(.ultraThinMaterial)
+                .overlay(shape.fill(currentTheme.color.opacity(0.14)))
+                .overlay(glassReflection)
+                .clipShape(shape)
+        } else if #available(macOS 26.0, *), AppSettings.activeWindowStyle == .liquidGlass {
             shape
                 .fill(Color.clear)
                 .glassEffect(
@@ -478,7 +486,38 @@ final class TrackingHostingView<Content: View>: NSHostingView<Content> {
     }
 }
 
+enum PanelMovement {
+    static func bounds(screen: NSRect, panelSize: NSSize, position: NotchPosition, providerCount: Int) -> ClosedRange<CGFloat> {
+        let margin: CGFloat = 12
+        if position == .bottomCenter {
+            let halfWidth = HorizontalBarLayout.expandedWidth(for: providerCount) / 2 + 50
+            let lower = screen.minX + margin + halfWidth - panelSize.width / 2
+            let upper = screen.maxX - margin - halfWidth - panelSize.width / 2
+            return lower...max(lower, upper)
+        }
+        let railHeight = CGFloat(max(1, providerCount)) * 76
+            + CGFloat(max(0, providerCount - 1)) * 12 + 96
+        let lower = screen.minY + margin + railHeight - panelSize.height
+        let upper = screen.maxY - margin - panelSize.height
+        return lower...max(lower, upper)
+    }
+
+    static func coordinate(offset: Double, bounds: ClosedRange<CGFloat>, horizontal: Bool) -> CGFloat {
+        let fraction = (min(max(offset, -1), 1) * (horizontal ? 1 : -1) + 1) / 2
+        return bounds.lowerBound + fraction * (bounds.upperBound - bounds.lowerBound)
+    }
+
+    static func offset(coordinate: CGFloat, bounds: ClosedRange<CGFloat>, horizontal: Bool) -> Double {
+        guard bounds.upperBound > bounds.lowerBound else { return 0 }
+        let fraction = (coordinate - bounds.lowerBound) / (bounds.upperBound - bounds.lowerBound)
+        return min(max((fraction * 2 - 1) * (horizontal ? 1 : -1), -1), 1)
+    }
+}
+
 final class NotchPanel: NSPanel {
+    // Transparent space may extend offscreen; only the visible rail constrains movement.
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+    var providerCount = 1
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 
@@ -509,9 +548,8 @@ final class NotchPanel: NSPanel {
         let position = NotchPosition(rawValue: UserDefaults.standard.string(forKey: AppSettings.notchPositionKey) ?? "") ?? .right
         let frame = screen.visibleFrame
         let positionOffset = min(max(UserDefaults.standard.double(forKey: AppSettings.notchPositionOffsetKey), -1), 1)
-        let verticalTravel = max(0, (frame.height - panelHeight - 40) / 2)
-        let horizontalTravel = max(0, (frame.width - panelWidth - 40) / 2)
-        let centeredVerticalOrigin = frame.midY - panelHeight / 2
+        let bounds = PanelMovement.bounds(screen: frame, panelSize: NSSize(width: panelWidth, height: panelHeight), position: position, providerCount: providerCount)
+        let coordinate = PanelMovement.coordinate(offset: positionOffset, bounds: bounds, horizontal: position == .bottomCenter)
 
         // The rail is the right-most 72pt of the canonical panel. Anchor that
         // rail to the selected screen edge while keeping its default position centered.
@@ -520,14 +558,14 @@ final class NotchPanel: NSPanel {
         case .right:
             origin = CGPoint(
                 x: frame.maxX - panelWidth,
-                y: centeredVerticalOrigin - positionOffset * verticalTravel)
+                y: coordinate)
         case .leftCenter:
             origin = CGPoint(
                 x: frame.minX,
-                y: centeredVerticalOrigin - positionOffset * verticalTravel)
+                y: coordinate)
         case .bottomCenter:
             origin = CGPoint(
-                x: frame.midX - panelWidth / 2 + positionOffset * horizontalTravel,
+                x: coordinate,
                 y: frame.minY)
         }
 
@@ -538,6 +576,9 @@ final class NotchPanel: NSPanel {
 @MainActor
 @Observable
 final class NotchInteractionState {
+    var onDragChanged: (() -> Void)?
+    var onDragEnded: (() -> Void)?
+    var isDragging = false
     var isHovered = false
     var pinnedOpen = false
     var isDetailVisible = false
@@ -590,8 +631,43 @@ final class NotchPanelController {
     private var localMouseMonitor: Any?
     private let mouseThrottle = MouseMoveThrottle()
     private var autoCollapseTask: Task<Void, Never>?
+    private var dragStart: (mouse: NSPoint, origin: NSPoint, screen: NSRect)?
+
+    private func dragChanged() {
+        if dragStart == nil {
+            guard let screen = panel.screen else { return }
+            dragStart = (NSEvent.mouseLocation, panel.frame.origin, screen.visibleFrame)
+            interaction.isDragging = true
+            autoCollapseTask?.cancel()
+        }
+        guard let start = dragStart else { return }
+        let mouse = NSEvent.mouseLocation
+        let horizontal = interaction.position == .bottomCenter
+        let bounds = PanelMovement.bounds(screen: start.screen, panelSize: panel.frame.size,
+            position: interaction.position, providerCount: interaction.providerCount)
+        let proposed = horizontal ? start.origin.x + mouse.x - start.mouse.x
+            : start.origin.y + mouse.y - start.mouse.y
+        let coordinate = min(max(proposed, bounds.lowerBound), bounds.upperBound)
+        var origin = start.origin
+        if horizontal { origin.x = coordinate } else { origin.y = coordinate }
+        panel.setFrameOrigin(origin)
+        interaction.panelFrame = panel.frame
+    }
+
+    private func dragEnded() {
+        guard let start = dragStart else { return }
+        let horizontal = interaction.position == .bottomCenter
+        let bounds = PanelMovement.bounds(screen: start.screen, panelSize: panel.frame.size,
+            position: interaction.position, providerCount: interaction.providerCount)
+        let coordinate = horizontal ? panel.frame.minX : panel.frame.minY
+        let offset = PanelMovement.offset(coordinate: coordinate, bounds: bounds, horizontal: horizontal)
+        UserDefaults.standard.set(offset, forKey: AppSettings.notchPositionOffsetKey)
+        dragStart = nil
+        interaction.isDragging = false
+    }
 
     func settingsDidChange() {
+        panel.providerCount = interaction.providerCount
         panel.place()
         interaction.position = NotchPosition(rawValue: UserDefaults.standard.string(forKey: AppSettings.notchPositionKey) ?? "") ?? .right
         interaction.displayMode = AppSettings.overlayDisplayMode
@@ -605,6 +681,8 @@ final class NotchPanelController {
         interaction.displayMode = AppSettings.overlayDisplayMode
         interaction.panelFrame = panel.frame
 
+        interaction.onDragChanged = { [weak self] in self?.dragChanged() }
+        interaction.onDragEnded = { [weak self] in self?.dragEnded() }
         let hostedView = TrackingHostingView(rootView: NotchView(
             store: store,
             interaction: interaction
@@ -612,7 +690,7 @@ final class NotchPanelController {
 
         hostedView.onExit = { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, !self.interaction.isDragging else { return }
                 self.autoCollapseTask?.cancel()
                 self.interaction.isHovered = false
                 self.interaction.isSettingsHovered = false
@@ -679,7 +757,7 @@ final class NotchPanelController {
 
     private func handleMouseMove(_ event: NSEvent) {
         // Hidden overlay must not pay for hover tracking at all.
-        guard interaction.displayMode != .hidden else { return }
+        guard interaction.displayMode != .hidden, !interaction.isDragging else { return }
         let location = event.window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
         let frame = panel.frame
         // Assigning panelFrame wakes every SwiftUI observer, so only publish
@@ -974,9 +1052,15 @@ struct NotchView: View {
         )
     }
 
+    private var repositionGesture: some Gesture {
+        DragGesture(minimumDistance: 4, coordinateSpace: .global)
+            .onChanged { _ in interaction.onDragChanged?() }
+            .onEnded { _ in interaction.onDragEnded?() }
+    }
+
     private var verticalLayout: some View {
         HStack(alignment: .top, spacing: 10) {
-            if isLeft { morphingNotchRail } else { Spacer() }
+            if isLeft { morphingNotchRail.simultaneousGesture(repositionGesture) } else { Spacer() }
 
             if let status = activeStatus, (interaction.isHovered || interaction.pinnedOpen) {
                 DetailPopoverCard(status: status, pointerY: relativePointerY, pointerOnLeft: isLeft)
@@ -994,7 +1078,7 @@ struct NotchView: View {
                     )
             }
 
-            if isLeft { Spacer() } else { morphingNotchRail }
+            if isLeft { Spacer() } else { morphingNotchRail.simultaneousGesture(repositionGesture) }
         }
         .frame(maxHeight: .infinity, alignment: .top)
     }
@@ -1028,6 +1112,7 @@ struct NotchView: View {
             }
 
             bottomIslandBar
+                .simultaneousGesture(repositionGesture)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -1088,17 +1173,12 @@ struct NotchView: View {
         .background(
             shape
                 .fill(Color.clear)
-                .background(ThemedGlass(shape: shape))
+                .background(ThemedGlass(shape: shape, edgePanel: true))
                 .overlay(
                     currentTheme.color.opacity(0.14)
                         .clipShape(shape)
                 )
                 .overlay(shape.stroke(Color.white.opacity(isExpanded ? 0.15 : 0.08), lineWidth: 0.75))
-                .shadow(
-                    color: Color.black.opacity(isExpanded ? 0.55 : 0.35),
-                    radius: isExpanded ? 18 : 5,
-                    y: -1
-                )
         )
         .overlay(alignment: .topTrailing) {
             if isExpanded {
@@ -1204,7 +1284,8 @@ struct NotchView: View {
                         flareHeight: isExpanded ? 36 : 0,
                         cornerRadius: isExpanded ? 28 : 8,
                         mirrored: isLeft
-                    )
+                    ),
+                    edgePanel: true
                 )
             )
             .overlay(
@@ -1218,7 +1299,6 @@ struct NotchView: View {
                         )
                     )
             )
-            .shadow(color: Color.black.opacity(isExpanded ? 0.5 : 0.35), radius: isExpanded ? 14 : 5, x: isExpanded ? -4 : -1, y: 0)
         )
         .overlay(alignment: isLeft ? .topLeading : .topTrailing) {
             if !isExpanded {
