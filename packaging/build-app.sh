@@ -16,7 +16,13 @@ mkdir -p "$STAGE" "$DIST/$APP_NAME.app/Contents/MacOS" "$DIST/$APP_NAME.app/Cont
 
 cp "$ROOT/.build/release/$APP_NAME" "$DIST/$APP_NAME.app/Contents/MacOS/"
 cp "$ROOT/packaging/Info.plist" "$DIST/$APP_NAME.app/Contents/"
-cp "$ROOT/Sources/Nootch/Resources/Nootch.icns" "$DIST/$APP_NAME.app/Contents/Resources/"
+# Change the resource name when the icon changes so an upgrade does not reuse
+# the previous icon's resource name in Launch Services / Dock caches.
+ICON_SOURCE="$ROOT/Sources/Nootch/Resources/Nootch.icns"
+ICON_HASH="$(shasum -a 256 "$ICON_SOURCE" | cut -c 1-16)"
+ICON_NAME="Nootch-$ICON_HASH.icns"
+cp "$ICON_SOURCE" "$DIST/$APP_NAME.app/Contents/Resources/$ICON_NAME"
+plutil -replace CFBundleIconFile -string "$ICON_NAME" "$DIST/$APP_NAME.app/Contents/Info.plist"
 if [ -d "$ROOT/.build/release/${APP_NAME}_Nootch.bundle" ]; then
     cp -R "$ROOT/.build/release/${APP_NAME}_Nootch.bundle" "$DIST/$APP_NAME.app/Contents/Resources/"
 fi
