@@ -1,13 +1,11 @@
+![nootch — 一眼看清，今天的 AI 编码花了多少](docs/media/og-image.png)
+
 # nootch · Vibe Usage 版
 
 > 在 Mac 屏幕边缘常驻一个小圆点，随时告诉你：**今天的 AI 编码用量** —— 花了多少钱、用了多少 token、跑了几个 session、哪些模型用得最多。
 
 ![platform](https://img.shields.io/badge/macOS%2015%2B-Apple%20Silicon-black)
 ![version](https://img.shields.io/github/v/release/xiaoan17/nootch?label=release)
-
-[![nootch 宣传视频](docs/media/nootch-promo.gif)](docs/media/nootch-promo.mp4)
-
-<sub>▶ 点击动图观看完整宣传视频（[MP4](docs/media/nootch-promo.mp4)）</sub>
 
 ## 二次开发声明
 
@@ -80,6 +78,10 @@ brew install --cask xiaoan17/nootch/nootch
 ```
 
 ## 使用
+
+[![nootch 演示](docs/media/nootch-promo.gif)](docs/media/nootch-promo.mp4)
+
+<sub>▶ 点击动图观看带配乐的完整宣传视频（[MP4](docs/media/nootch-promo.mp4)）</sub>
 
 - 把鼠标移到**屏幕右缘 / 左缘**（可在设置里改到底部居中），面板就会滑出
 - 圆点上直接显示**当前窗口费用**（如 `$82.2`），窗口可在设置里切换（默认今日，可选 24h / 近 7 天 / 近 30 天）
