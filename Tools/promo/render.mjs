@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // Renders promo.html frame by frame with Playwright + Google Chrome, then encodes
 // docs/media/nootch-promo.mp4, nootch-promo.gif and nootch-promo-poster.png with ffmpeg.
+// The soundtrack is synthesised by audio.py (python3 + numpy) and muxed into the mp4;
+// the GIF is cut from the silent intermediate. Re-score only: python3 Tools/promo/audio.py
 //
 //   node Tools/promo/render.mjs                 # full render
 //   node Tools/promo/render.mjs --stills 4,9,13 # only write preview PNGs for those seconds
 //
-// Env: FRAMES_DIR (default $TMPDIR/nootch-promo-frames), FFMPEG (default ffmpeg),
+// Env: FRAMES_DIR (default $TMPDIR/nootch-promo-frames), FFMPEG (default ffmpeg), PYTHON (default python3),
 //      PLAYWRIGHT_PATH (a node_modules/playwright dir, if `playwright` is not resolvable).
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
@@ -74,18 +76,21 @@ try {
     }));
 
     mkdirSync(media, { recursive: true });
+    const silent = join(framesDir, 'silent.mp4');
     const mp4 = join(media, 'nootch-promo.mp4');
     run('-framerate', String(FPS), '-i', join(framesDir, 'f%05d.jpg'),
       '-vf', 'scale=in_range=pc:out_range=tv,format=yuv420p',
       '-c:v', 'libx264', '-preset', 'slow', '-crf', '18', '-pix_fmt', 'yuv420p',
-      '-profile:v', 'high', '-movflags', '+faststart', mp4);
+      '-profile:v', 'high', '-movflags', '+faststart', silent);
+    execFileSync(process.env.PYTHON || 'python3', [join(here, 'audio.py'), '--video', silent, '--out', mp4],
+      { stdio: 'inherit', env: { ...process.env, FFMPEG: ffmpeg } });
 
     const gif = join(media, 'nootch-promo.gif');
     const [a, b] = GIF_RANGE;
     const filters = 'fps=20,scale=800:-1:flags=lanczos';
     const palette = join(framesDir, 'palette.png');
-    run('-ss', String(a), '-t', String(b - a), '-i', mp4, '-vf', `${filters},palettegen=stats_mode=full`, palette);
-    run('-ss', String(a), '-t', String(b - a), '-i', mp4, '-i', palette, '-lavfi',
+    run('-ss', String(a), '-t', String(b - a), '-i', silent, '-vf', `${filters},palettegen=stats_mode=full`, palette);
+    run('-ss', String(a), '-t', String(b - a), '-i', silent, '-i', palette, '-lavfi',
       `${filters}[x];[x][1:v]paletteuse=dither=sierra2_4a:diff_mode=rectangle`, gif);
 
     const page = await openPage(browser);
