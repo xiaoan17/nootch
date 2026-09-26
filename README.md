@@ -3,6 +3,11 @@
 > 在 Mac 屏幕边缘常驻一个小圆点，随时告诉你：**今天的 AI 编码用量** —— 花了多少钱、用了多少 token、跑了几个 session、哪些模型用得最多。
 
 ![platform](https://img.shields.io/badge/macOS%2015%2B-Apple%20Silicon-black)
+![version](https://img.shields.io/github/v/release/xiaoan17/nootch?label=release)
+
+[![nootch 宣传视频](docs/media/nootch-promo.gif)](docs/media/nootch-promo.mp4)
+
+<sub>▶ 点击动图观看完整宣传视频（[MP4](docs/media/nootch-promo.mp4)）</sub>
 
 ## 二次开发声明
 
@@ -91,6 +96,18 @@ v1.2.0 起无需任何额外组件——nootch 运行期间每 30 分钟自动�
 /Applications/nootch.app/Contents/MacOS/nootch --vibe-sync-dry-run  # 只算差异不上传
 ```
 
+## 更新日志
+
+| 版本 | 主要变化 |
+|---|---|
+| 未发布 | 同步原项目上游修复：资源包查找不再依赖 `Bundle.module`（缺资源时降级而不是崩溃）；打包脚本强制校验资源包、去掉 `--deep`、支持 `CODESIGN_IDENTITY` 正式签名并在签名后校验 |
+| v1.3.4 | 统一 App 图标加载；图标文件名带内容哈希，升级后 Dock 不再显示旧图标 |
+| v1.3.3 | 去掉详情卡阴影 |
+| v1.3.2 | 面板支持直接拖动调整位置；去掉外层阴影 |
+| v1.3.1 | 新仓鼠图标，内置 macOS 圆角遮罩 |
+| v1.3.0 | 费用窗口可选：今日 / 24h / 近 7 天 / 近 30 天 |
+| v1.2.0 | 内置 vibe-usage 同步引擎，不再需要 Node.js 或后台 daemon |
+
 ## 从源码构建
 
 需要 Xcode Command Line Tools 和 Swift 6：
@@ -103,6 +120,16 @@ Tools/test.sh             # 跑测试（兼容独立 Command Line Tools 的 Swif
 packaging/build-app.sh    # 打出 .app 和 DMG（在 dist/）
 ```
 
+`packaging/build-app.sh` 默认使用 ad-hoc 签名。有 Developer ID 证书时可以指定签名身份，获得跨版本稳定的签名：
+
+```sh
+CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" packaging/build-app.sh
+```
+
+打包时如果缺少 `nootch_Nootch.bundle` 资源包会直接失败，避免发出没有 logo / 图标的 DMG。
+
+宣传视频的源码在 `Tools/promo/`，可以重新渲染 `docs/media/` 下的视频和动图；`node Tools/promo/og.mjs` 生成社交分享图（`og-image.png` 1200×630、`social-preview.png` 1280×640）。
+
 `Tools/test.sh` 会检测当前开发工具目录，为部分独立 Command Line Tools 版本补上 Swift Testing 的框架和运行库搜索路径；不修改系统工具链。可以透传测试参数，例如 `Tools/test.sh --filter VibeUsage`。完整 Xcode 等其他环境会直接使用 `swift test`。
 
 ## 致谢 / References
@@ -110,9 +137,10 @@ packaging/build-app.sh    # 打出 .app 和 DMG（在 dist/）
 - [DeepanshuMishraa/nootch](https://github.com/DeepanshuMishraa/nootch) — 原项目，全部 UI 与面板框架
 - [vibe-cafe/vibe-usage](https://github.com/vibe-cafe/vibe-usage) — 用量数据解析、同步与 API
 - [vibecafe.ai](https://vibecafe.ai) — 用量看板与数据服务
+- [@luisKisters](https://github.com/luisKisters) — 上游 PR #2（资源包查找与签名修复），已同步到本 fork
 
 ---
 
 ## English
 
-A derivative fork of [nootch](https://github.com/DeepanshuMishraa/nootch) (all UI credit goes to the original author) that drops every provider integration except one: it shows **today's AI coding usage** from [vibecafe.ai](https://vibecafe.ai) — cost, tokens, sessions, active time, and top models — in the same lovely always-on-top screen-edge overlay. Since v1.2.0 it also embeds a Swift-native reimplementation of the [vibe-usage](https://github.com/vibe-cafe/vibe-usage) sync protocol, parsing local Claude Code / Codex / Kimi Code / Grok / Pi logs and uploading token counters every 30 minutes — no Node.js, no separate daemon, one app is the whole loop. It never touches the macOS Keychain (no password prompts) and never uploads message content. Run `npx @vibe-cafe/vibe-usage` once to obtain an API key, then install the DMG from Releases.
+A derivative fork of [nootch](https://github.com/DeepanshuMishraa/nootch) (all UI credit goes to the original author) that drops every provider integration except one: it shows **today's AI coding usage** from [vibecafe.ai](https://vibecafe.ai) — cost, tokens, sessions, active time, and top models — in the same lovely always-on-top screen-edge overlay. Since v1.2.0 it also embeds a Swift-native reimplementation of the [vibe-usage](https://github.com/vibe-cafe/vibe-usage) sync protocol, parsing local Claude Code / Codex / Kimi Code / Grok / Pi logs and uploading token counters every 30 minutes — no Node.js, no separate daemon, one app is the whole loop. It never touches the macOS Keychain (no password prompts) and never uploads message content. Run `npx @vibe-cafe/vibe-usage` once to obtain an API key, then install the DMG from Releases. A short promo video lives at [`docs/media/nootch-promo.mp4`](docs/media/nootch-promo.mp4).

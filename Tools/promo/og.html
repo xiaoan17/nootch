@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>nootch og image</title>
+<!-- Social share card. og.mjs opens this at ?w=1200&h=630 (Open Graph) and
+     ?w=1280&h=640 (GitHub social preview) and captures at deviceScaleFactor 2. -->
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { overflow: hidden; background: #0d1f22; }
+body { font-family: "PingFang SC", -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif; color: #fff; -webkit-font-smoothing: antialiased; }
+#stage { position: relative; overflow: hidden; display: flex; align-items: center; }
+#wall { position: absolute; inset: -20px; background:
+  radial-gradient(55% 70% at 12% 18%, #4f8f5a 0%, transparent 60%),
+  radial-gradient(45% 60% at 88% 12%, #c7a56a 0%, transparent 55%),
+  radial-gradient(70% 80% at 70% 105%, #1d5263 0%, transparent 60%),
+  radial-gradient(60% 60% at 5% 100%, #2f5d3a 0%, transparent 60%),
+  linear-gradient(160deg, #1c3a2a, #0d1f22); }
+#shade { position: absolute; inset: 0; background: linear-gradient(90deg, rgba(6,14,10,.55), rgba(6,14,10,.15) 55%, transparent); }
+
+#copy { position: relative; padding-left: 80px; flex: 1; }
+.brand { display: flex; align-items: center; gap: 22px; }
+.brand img { width: 104px; height: 104px; filter: drop-shadow(0 14px 30px rgba(0,0,0,.45)); }
+.brand b { font: 700 76px/1 -apple-system, "SF Pro Display", sans-serif; letter-spacing: -2px; }
+h1 { margin-top: 34px; font-size: 44px; font-weight: 600; line-height: 1.3; letter-spacing: .5px; text-shadow: 0 2px 18px rgba(0,0,0,.4); }
+h1 em { font-style: normal; color: #8ff0a0; }
+.sub { margin-top: 14px; font-size: 22px; color: rgba(255,255,255,.8); }
+.badges { margin-top: 30px; display: flex; gap: 12px; flex-wrap: wrap; }
+.badges span { font-size: 18px; padding: 8px 16px; border-radius: 22px; background: rgba(255,255,255,.1); box-shadow: inset 0 0 0 1px rgba(255,255,255,.22); white-space: nowrap; }
+.badges span::before { content: "✓ "; color: #7ee787; }
+.url { margin-top: 28px; font: 500 19px/1 "SF Mono", ui-monospace, Menlo, monospace; color: #b9f5c1; opacity: .9; }
+
+/* Panel + card, drawn at the app's native point sizes and scaled up as one group. */
+#ui { position: relative; width: 400px; height: 330px; margin-right: 0; transform: scale(1.32); transform-origin: 100% 50%; }
+.glass { position: absolute; inset: 0; background:
+  linear-gradient(135deg, rgba(255,255,255,.18), rgba(255,255,255,.06) 35%, transparent 60%, rgba(255,255,255,.04)),
+  rgba(82, 184, 61, .14), rgba(16, 26, 18, .66);
+  backdrop-filter: blur(22px) saturate(1.7); }
+.stroke { position: absolute; left: 0; top: 0; overflow: visible; }
+.stroke path { fill: none; stroke: rgba(255,255,255,.22); stroke-width: .8; }
+#panel { position: absolute; right: 0; top: 79px; width: 72px; height: 172px; filter: drop-shadow(0 8px 24px rgba(0,0,0,.35)); }
+#railItem { position: absolute; left: 0; top: 48px; width: 72px; height: 76px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; }
+#gauge { position: relative; width: 42px; height: 42px; }
+#gauge svg { position: absolute; inset: 0; }
+#gauge .ecg { inset: 12px; width: 18px; height: 18px; }
+#dotLabel { font: 600 13px/18px "SF Mono", ui-monospace, Menlo, monospace; }
+#card { position: absolute; left: 0; width: 312px; filter: drop-shadow(0 14px 36px rgba(0,0,0,.4)); }
+#cardBody { position: relative; padding: 14px 24px 14px 16px; display: flex; flex-direction: column; gap: 14px; }
+.chead { display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 600; }
+.chead .ecg { width: 19px; height: 19px; }
+.chead span { flex: 1; }
+#live { font: 600 10.5px/1 -apple-system, sans-serif; font-style: normal; padding: 3px 7.5px; border-radius: 20px; background: rgba(255,255,255,.12); box-shadow: inset 0 0 0 .75px rgba(255,255,255,.22); display: flex; gap: 5px; align-items: center; }
+#live i { width: 5px; height: 5px; border-radius: 50%; background: #5fe07a; }
+.csec { font-size: 12px; font-weight: 500; color: rgba(255,255,255,.85); margin-bottom: -9px; }
+#rows { display: flex; flex-direction: column; gap: 5px; font-size: 11.5px; color: rgba(255,255,255,.6); }
+.row { display: flex; justify-content: space-between; gap: 8px; height: 16px; line-height: 16px; }
+.row b { font-weight: 400; font-variant-numeric: tabular-nums; color: rgba(255,255,255,.72); }
+.row.main b { color: #fff; font-weight: 600; }
+.bar { height: 3px; border-radius: 3px; background: rgba(255,255,255,.08); margin: -3px 0 2px; overflow: hidden; }
+.bar i { display: block; height: 100%; border-radius: 3px; background: linear-gradient(90deg, #38e085, #24c761); }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="wall"></div>
+  <div id="shade"></div>
+  <div id="copy">
+    <div class="brand"><img src="../../Sources/Nootch/Resources/NootchIcon.png" alt=""><b>nootch</b></div>
+    <h1>一眼看清，今天的<br><em>AI 编码</em>花了多少</h1>
+    <div class="sub">macOS 屏幕边缘的用量小圆点 · 费用 / Tokens / 模型</div>
+    <div class="badges"><span>Claude Code · Codex · Kimi · Grok · Pi</span><span>零钥匙串弹窗</span></div>
+    <div class="url">github.com/xiaoan17/nootch</div>
+  </div>
+  <div id="ui">
+    <div id="card">
+      <div id="cardGlass" class="glass"></div>
+      <svg id="cardStroke" class="stroke"><path/></svg>
+      <div id="cardBody">
+        <div class="chead">
+          <svg class="ecg" viewBox="0 0 24 24"><path d="M2 12h4l2.2-5 3.6 11 2.6-8 1.6 2H22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>Vibe Usage</span><em id="live"><i></i>Live</em>
+        </div>
+        <div class="csec">今日用量</div>
+        <div id="rows"></div>
+      </div>
+    </div>
+    <div id="panel">
+      <div id="railGlass" class="glass"></div>
+      <svg id="railStroke" class="stroke"><path/></svg>
+      <div id="railItem">
+        <div id="gauge">
+          <svg viewBox="0 0 42 42"><circle cx="21" cy="21" r="18.4" fill="none" stroke="rgba(255,255,255,.14)" stroke-width="5.2"/></svg>
+          <svg class="ecg" viewBox="0 0 24 24"><path d="M2 12h4l2.2-5 3.6 11 2.6-8 1.6 2H22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <div id="dotLabel"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="promo-lib.js"></script>
+<script>
+const q = new URLSearchParams(location.search);
+const W = +q.get('w') || 1200, H = +q.get('h') || 630;
+const stage = document.getElementById('stage');
+stage.style.width = W + 'px'; stage.style.height = H + 'px';
+document.body.style.width = W + 'px'; document.body.style.height = H + 'px';
+
+const day = WINDOWS[0];
+const row = (label, value, cls = '') => `<div class="row ${cls}"><span>${label}</span><b>${value}</b></div>`;
+document.getElementById('rows').innerHTML =
+  row('Cost', '$' + day.cost.toFixed(2), 'main') +
+  row('Tokens', compactTokens(day.tokens)) +
+  row('Sessions', `${day.sessions} · ${compactDuration(day.active)}`) +
+  MODELS.slice(0, 3).map(m =>
+    row(m.model, `${compactTokens(day.tokens * m.tok)} · $${(day.cost * m.cost).toFixed(2)}`) +
+    `<div class="bar"><i style="width:${(m.cost / MODELS[0].cost * 100).toFixed(1)}%"></i></div>`).join('');
+document.getElementById('dotLabel').textContent = compactCost(day.cost);
+
+function shape(glass, stroke, w, h, d) {
+  document.getElementById(glass).style.clipPath = `path('${d}')`;
+  const sv = document.getElementById(stroke);
+  sv.setAttribute('width', w); sv.setAttribute('height', h);
+  sv.firstChild.setAttribute('d', d);
+}
+shape('railGlass', 'railStroke', 72, 172, railPath(72, 172, 24, 36, 28));
+const card = document.getElementById('card');
+const ch = card.offsetHeight, gaugeY = 79 + 48 + 21;
+const cardTop = Math.max(0, gaugeY - ch / 2);
+card.style.top = cardTop + 'px';
+shape('cardGlass', 'cardStroke', 312, ch, calloutPath(312, ch, gaugeY - cardTop));
+</script>
+</body>
+</html>

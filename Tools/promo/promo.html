@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>nootch promo</title>
+<!-- Logical stage is 960x540; render.mjs captures at deviceScaleFactor 2 (1920x1080). -->
+<link rel="stylesheet" href="promo.css">
+</head>
+<body>
+<div id="stage">
+  <div id="wall"></div>
+  <div id="menubar">
+    <div class="mb-left"><span class="apple">&#xF8FF;</span><b>终端</b><span>文件</span><span>编辑</span><span>显示</span><span>窗口</span><span>帮助</span></div>
+    <div class="mb-right"><span class="mb-ico batt"></span><span>9月26日 周六 10:24</span></div>
+  </div>
+
+  <div id="term">
+    <div class="tbar"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i><span>zsh — demo-app</span></div>
+    <pre id="termtext"></pre>
+  </div>
+
+  <div id="panel">
+    <div id="railGlass" class="glass"></div>
+    <svg id="railStroke" class="stroke"><path/></svg>
+    <div id="tabDot"></div>
+    <div id="railItem">
+      <div id="gauge">
+        <svg viewBox="0 0 42 42"><circle cx="21" cy="21" r="18.4" fill="none" stroke="rgba(255,255,255,.14)" stroke-width="5.2"/></svg>
+        <svg class="ecg" viewBox="0 0 24 24"><path d="M2 12h4l2.2-5 3.6 11 2.6-8 1.6 2H22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div id="dotLabel">$82.2</div>
+    </div>
+  </div>
+
+  <div id="card">
+    <div id="cardGlass" class="glass"></div>
+    <svg id="cardStroke" class="stroke"><path/></svg>
+    <div id="cardBody">
+      <div class="chead">
+        <svg class="ecg" viewBox="0 0 24 24"><path d="M2 12h4l2.2-5 3.6 11 2.6-8 1.6 2H22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>Vibe Usage</span><em id="live"><i></i>Live</em>
+      </div>
+      <div class="csec" id="secTitle">今日用量</div>
+      <div id="rows"></div>
+    </div>
+  </div>
+
+  <div id="seg">
+    <div class="seg-label">费用窗口</div>
+    <div class="seg-track"><div id="segThumb"></div>
+      <span>今日</span><span>24h</span><span>近 7 天</span><span>近 30 天</span>
+    </div>
+  </div>
+
+  <div id="toast">位置已保存</div>
+
+  <div id="caption"><div class="cap-t"></div><div class="cap-s"></div></div>
+
+  <div id="intro"><div class="i-t">今天的 AI 编码，花了多少？</div><div class="i-s">答案，一直在屏幕边缘。</div></div>
+
+  <div id="tools">
+    <div class="tl-title">支持你常用的 AI 编码工具</div>
+    <div class="tl-row"></div>
+    <svg id="flow" viewBox="0 0 960 540"></svg>
+    <div id="engine"><b>nootch</b> 内置同步引擎 <span>→</span> vibecafe.ai</div>
+    <div class="tl-badges"><span>不读钥匙串</span><span>不上传消息内容</span><span>每 30 分钟自动同步</span></div>
+  </div>
+
+  <div id="outro">
+    <img id="oIcon" src="../../Sources/Nootch/Resources/NootchIcon.png">
+    <div id="oName">nootch</div>
+    <div id="oSlogan">一眼看清，今天的 AI 编码花了多少</div>
+    <div id="oUrl">github.com/xiaoan17/nootch</div>
+  </div>
+
+  <div id="cursor"><svg viewBox="0 0 28 28"><path d="M6 3v19.5l4.9-4.7 3.1 7.2 3.4-1.5-3.1-7h6.8z" fill="#111" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/></svg><div id="ripple"></div></div>
+  <div id="fade"></div>
+</div>
+<script src="promo-lib.js"></script>
+<script src="promo.js"></script>
+</body>
+</html>
