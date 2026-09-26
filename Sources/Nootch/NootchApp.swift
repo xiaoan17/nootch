@@ -57,7 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Installed apps use CFBundleIconFile for the Dock and app switcher.
         // A runtime override is only needed for the bare SwiftPM executable.
         if Bundle.main.bundleURL.pathExtension != "app",
-           let iconURL = Bundle.nootchResources.url(forResource: "Nootch", withExtension: "icns"),
+           let iconURL = ResourceBundle.url(forResource: "Nootch", withExtension: "icns"),
            let icon = NSImage(contentsOf: iconURL) {
             icon.isTemplate = false
             NSApp.applicationIconImage = icon
