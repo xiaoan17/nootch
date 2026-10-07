@@ -62,4 +62,8 @@ sh Tools/install-local.sh  # 安装本地构建，保留 /tmp 下旧版备份
 - libzstd 与 nootch 均为 arm64；库仅依赖 macOS libSystem，无 Homebrew 绝对运行时依赖。
 - `/Applications/nootch.app` 已安装 1.4.0（build 12），签名通过，独立启动曾验证。安装二进制 SHA-256：`4538d4accf8e55e96bd91035defa57f272848ec472b31a1203ff6ad4164b344b`，与 `dist/nootch.app` 相同。
 - 旧 App 备份：`/tmp/nootch-backup.6bfSU7/nootch.app`。
-- 真实上传验收被自动审批拒绝，理由为缺少向配置目的地 `https://vibecafe.ai` 发送真实本地用量/会话元数据的明确授权。没有执行该手动上传命令；App 已暂停，等待用户选择是否验收上传及恢复原有自动同步。
+- 首次真实上传验收因自动审批要求明确授权而暂停。用户随后明确答复“当然允许”，授权向已配置的 `https://vibecafe.ai` 执行真实同步并恢复 App 自动同步。
+- 授权后真实同步成功：live 3480 buckets / 2311 sessions；changed 与服务端 accepted 均为 161 buckets / 296 sessions；dropped 0，34 来源全部成功，无 failed source。
+- 增量状态已落盘：3480 个 bucket hash、2311 个 session hash，上传身份存在；清理 2110 个失效本地 key，未删除云端历史。同步前状态备份位于 `/tmp/nootch-backup.6bfSU7/state-before-approved-sync.json`（权限 0600）。
+- 同步后只读复核：live 3482 buckets / 2311 sessions，仅剩 3 buckets / 3 sessions 变化，uploaded 0、pruned 0，未出现整批重传；34 来源仍全部成功。
+- 复核后已重新启动 `/Applications/nootch.app`。自动同步偏好未覆盖，沿用 App 默认开启行为：启动后 60 秒首轮，之后每 30 分钟。
