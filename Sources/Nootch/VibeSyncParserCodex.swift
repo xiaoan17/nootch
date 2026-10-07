@@ -10,15 +10,25 @@ import Synchronization
 // timing events. Message content is never read into the result: only token
 // counts, model ids, project names and timestamps are extracted.
 //
+// Duplicate session ids are not just archive copies: Codex can split one
+// session into disjoint continuation rollouts (upstream 84d007b). Each group
+// of same-id files is merged into a single virtual transcript before
+// indexing/parsing: exact cross-file copies collapse by (payload hash,
+// occurrence), per-file adjacency constrains a timestamp-ordered topological
+// walk, and contradictory order marks the source skipped rather than
+// inventing a sequence that might double-count. Merged records retain only
+// the fields the token/timing passes read (accountingRecord) — chat/tool
+// text is dropped at merge time, never retained.
+//
 // Deliberate simplifications vs the official parser:
 // - codex-cache.js (disk cache, tail-incremental append parsing, work-budget
 //   checkpointing, rolling audits) is replaced by an in-memory mtime/size
 //   cache. Files whose signature is unchanged are never re-read; a live file
 //   that grew since the last sync is re-parsed in full (bounded to the size
-//   stat'ed at discovery, like the JS snapshot).
+//   stat'ed at discovery, like the JS snapshot). Merged groups get their own
+//   synthetic cache entries whose signature covers every member.
 // - Extra roots (codexExtraHome / extraRoots) and the cindy harness ledger
-//   are not supported; only the primary Codex home is scanned, so this
-//   parser never returns `skipped: true` — default roots are best-effort.
+//   are not supported; only the primary Codex home is scanned.
 // - Token fingerprints hash a sorted-keys JSON serialization of the payload.
 //   They are not byte-identical to the JS `JSON.stringify` hashes, but they
 //   are only ever compared against other fingerprints produced here.
@@ -90,9 +100,13 @@ struct VibeSyncCodexParser: VibeLogParser {
         discovered.sort { $0.path < $1.path }
         if discovered.isEmpty { return VibeParseResult() }
 
+        // Physical paths are pruned here; synthetic segment-group keys are
+        // pruned after grouping, once the live set is known.
         Self.fileCache.withLock { cache in
             let live = Set(discovered.map(\.path))
-            cache.keys.filter { !live.contains($0) }.forEach { cache[$0] = nil }
+            cache.keys
+                .filter { !live.contains($0) && !Self.isGroupCacheKey($0) }
+                .forEach { cache[$0] = nil }
         }
 
         // Cheap discovery pass: read only far enough for the canonical
@@ -111,7 +125,12 @@ struct VibeSyncCodexParser: VibeLogParser {
             if let cached, file.signature.size >= cached.headerMinSize, file.signature.mtime >= cached.headerMtime {
                 header = cached.header
             } else {
-                guard let read = Self.readHeader(at: file.path, maxBytes: file.signature.size) else { continue }
+                // An unreadable header may hide a continuation segment of a
+                // known session; never upload the readable remainder as the
+                // complete total (upstream 84d007b).
+                guard let read = Self.readHeader(at: file.path, maxBytes: file.signature.size) else {
+                    return VibeParseResult(skipped: true)
+                }
                 header = read
                 Self.fileCache.withLock { cache in
                     var entry = cache[file.path] ?? CachedFile(headerMinSize: 0, headerMtime: 0, header: read)
@@ -173,44 +192,134 @@ struct VibeSyncCodexParser: VibeLogParser {
             metas[state.path] = index
         }
 
-        // Select the most complete physical copy of each session: the same
-        // rollout can briefly exist in both sessions/ and archived_sessions/
-        // during an archive move, and counting both would double its usage.
+        // Duplicate ids can be disjoint continuation segments, not just
+        // archive copies (upstream 84d007b). Each group becomes one virtual
+        // transcript with its own synthetic cache entry; the physical member
+        // caches stay untouched. Merging is lazy — a fully cached group is
+        // not re-read at all.
+        struct Unit {
+            let key: String  // physical path, or a synthetic group cache key
+            let signature: FileSignature
+            let header: RolloutHeader
+            var segments: [SegmentRecord]?
+            var members: [(path: String, snapshotSize: Int)]?
+        }
+        var consumedPaths = Set<String>()
+        var groupUnits: [Unit] = []
+        for id in duplicateIds.sorted() {
+            let members = states
+                .filter { $0.header.sessionId == id }
+                .sorted {
+                    let lhs = metas[$0.path]?.parsedRecordCount ?? 0
+                    let rhs = metas[$1.path]?.parsedRecordCount ?? 0
+                    return lhs != rhs ? lhs > rhs : $0.path < $1.path
+                }
+            // A member whose index pass failed hides part of the session;
+            // never upload the readable remainder as its complete total.
+            guard members.allSatisfy({ metas[$0.path] != nil }) else {
+                return VibeParseResult(skipped: true)
+            }
+            let key = Self.groupCacheKey(for: id)
+            let signature = FileSignature(
+                size: members.reduce(0) { $0 + $1.signature.size },
+                mtime: members.map(\.signature.mtime).max() ?? 0,
+                tag: Self.sha256Hex(members
+                    .map { "\($0.path)|\($0.signature.size)|\($0.signature.mtime)" }
+                    .sorted().joined(separator: "\n")))
+            let cached = Self.fileCache.withLock { $0[key] }
+            var segments: [SegmentRecord]?
+            let meta: FileMeta
+            if let cached, cached.signature == signature, let index = cached.index {
+                meta = index
+            } else {
+                guard let merged = Self.mergeSegments(
+                    members: members.map { (path: $0.path, snapshotSize: $0.signature.size) })
+                else {
+                    // Conflicting record order or an unreadable member: skip
+                    // the source rather than invent a possibly double-counting
+                    // order.
+                    return VibeParseResult(skipped: true)
+                }
+                segments = merged
+                let built = Self.buildIndex(segments: merged, path: key)
+                Self.fileCache.withLock { cache in
+                    var entry = cache[key] ?? CachedFile(
+                        headerMinSize: 0, headerMtime: 0, header: members[0].header)
+                    entry.signature = signature
+                    entry.index = built
+                    entry.boundaryKey = nil
+                    entry.entries = []
+                    entry.events = []
+                    cache[key] = entry
+                }
+                meta = built
+            }
+            metas[key] = meta
+            needsIndex.insert(key)
+            consumedPaths.formUnion(members.map(\.path))
+            groupUnits.append(Unit(
+                key: key, signature: signature, header: members[0].header,
+                segments: segments,
+                members: members.map { (path: $0.path, snapshotSize: $0.signature.size) }))
+        }
+        Self.fileCache.withLock { cache in
+            let liveGroups = Set(groupUnits.map(\.key))
+            cache.keys
+                .filter { Self.isGroupCacheKey($0) && !liveGroups.contains($0) }
+                .forEach { cache[$0] = nil }
+        }
+
+        // One index per logical session — merged continuation groups included —
+        // feeds the unchanged fork/subagent replay boundary logic.
+        let units = states
+            .filter { !consumedPaths.contains($0.path) }
+            .map { Unit(key: $0.path, signature: $0.signature, header: $0.header, segments: nil) }
+            + groupUnits
         var sessionById: [String: FileMeta] = [:]
-        for state in states {
-            guard let meta = metas[state.path], let id = meta.sessionId else { continue }
+        for unit in units {
+            guard let meta = metas[unit.key], let id = meta.sessionId else { continue }
             let count = meta.parsedRecordCount ?? 0
             if let existing = sessionById[id], (existing.parsedRecordCount ?? 0) >= count { continue }
             sessionById[id] = meta
         }
 
         var result = VibeParseResult()
-        for state in states {
-            guard let meta = metas[state.path] else { continue }
-            if let id = meta.sessionId, sessionById[id]?.path != state.path { continue }
+        for var unit in units {
+            guard let meta = metas[unit.key] else { continue }
+            if let id = meta.sessionId, sessionById[id]?.path != unit.key { continue }
 
-            let indexed = needsIndex.contains(state.path)
+            let indexed = needsIndex.contains(unit.key)
             let boundary = indexed
                 ? Self.replayBoundary(meta, sessionById: sessionById)
                 : ReplayBoundary(rawTokenCount: 0, recordIndex: nil)
             let key = "\(boundary.rawTokenCount):\(boundary.recordIndex.map(String.init) ?? "")"
 
-            if let cached = Self.fileCache.withLock({ $0[state.path] }),
-               cached.signature == state.signature, cached.boundaryKey == key {
+            if let cached = Self.fileCache.withLock({ $0[unit.key] }),
+               cached.signature == unit.signature, cached.boundaryKey == key {
                 result.entries.append(contentsOf: cached.entries)
                 result.events.append(contentsOf: cached.events)
                 continue
             }
+            // A group whose index came from cache merges only now; the
+            // transient combined transcript is never retained past the parse.
+            if unit.segments == nil, let members = unit.members {
+                guard let merged = Self.mergeSegments(members: members) else {
+                    return VibeParseResult(skipped: true)
+                }
+                unit.segments = merged
+            }
             let parsed = try Self.parseFile(
-                at: state.path, maxBytes: state.signature.size,
-                meta: meta, boundary: boundary, indexed: indexed)
+                at: unit.key, maxBytes: unit.signature.size,
+                meta: meta, boundary: boundary, indexed: indexed, segments: unit.segments)
             Self.fileCache.withLock { cache in
-                var entry = cache[state.path] ?? CachedFile(headerMinSize: state.signature.size, headerMtime: state.signature.mtime, header: state.header)
-                entry.signature = state.signature
+                var entry = cache[unit.key] ?? CachedFile(
+                    headerMinSize: unit.signature.size, headerMtime: unit.signature.mtime,
+                    header: unit.header)
+                entry.signature = unit.signature
                 entry.boundaryKey = key
                 entry.entries = parsed.entries
                 entry.events = parsed.events
-                cache[state.path] = entry
+                cache[unit.key] = entry
             }
             result.entries.append(contentsOf: parsed.entries)
             result.events.append(contentsOf: parsed.events)
@@ -349,6 +458,24 @@ struct VibeSyncCodexParser: VibeLogParser {
     // token_count ordinals on a monotonic timeline; tokenFingerprints
     // identifies an exact copied sequence even for last-N-turns forks.
     private static func buildIndex(at path: String, maxBytes: Int) -> FileMeta? {
+        buildIndex(path: path) { consume in
+            forEachRecord(at: path, maxBytes: maxBytes, consume: consume)
+        }
+    }
+
+    // Index over an already-merged continuation transcript; the in-memory
+    // walk cannot fail (upstream indexSessionFile with `lines`).
+    private static func buildIndex(segments: [SegmentRecord], path: String) -> FileMeta {
+        guard let meta = buildIndex(path: path, forEach: { consume in
+            segments.forEach(consume)
+            return true
+        }) else { preconditionFailure("in-memory segment walk cannot fail") }
+        return meta
+    }
+
+    private static func buildIndex(
+        path: String, forEach iterate: ((SegmentRecord) -> Void) -> Bool
+    ) -> FileMeta? {
         var meta = FileMeta(path: path)
         var sessionMetaCount = 0
         var parsedRecordCount = 0
@@ -358,8 +485,8 @@ struct VibeSyncCodexParser: VibeLogParser {
         var tokenFingerprints: [String] = []
         var pendingTokenTimeIndexes: [Int] = []
 
-        guard forEachLine(at: path, maxBytes: maxBytes, { line in
-            guard let object = parseObject(line) else { return true }
+        guard iterate({ record in
+            let object = record.object
             parsedRecordCount += 1
 
             let recordTimestamp = timestampMs(object["timestamp"])
@@ -387,7 +514,7 @@ struct VibeSyncCodexParser: VibeLogParser {
                 }
             } else if type == "event_msg", payload?["type"] as? String == "token_count", let payload {
                 rawTokenCount += 1
-                tokenFingerprints.append(tokenFingerprint(payload))
+                tokenFingerprints.append(record.tokenFingerprint ?? tokenFingerprint(payload))
                 if recordTimestamp == nil {
                     tokenTimes.append(.infinity)
                     pendingTokenTimeIndexes.append(tokenTimes.count - 1)
@@ -408,7 +535,6 @@ struct VibeSyncCodexParser: VibeLogParser {
                     meta.ownTaskBoundary = boundary
                 }
             }
-            return true
         }) else { return nil }
 
         meta.sessionMetaCount = sessionMetaCount
@@ -489,7 +615,8 @@ struct VibeSyncCodexParser: VibeLogParser {
     // MARK: - Usage pass (parseSessionFile)
 
     private static func parseFile(
-        at path: String, maxBytes: Int, meta: FileMeta, boundary: ReplayBoundary, indexed: Bool
+        at path: String, maxBytes: Int, meta: FileMeta, boundary: ReplayBoundary, indexed: Bool,
+        segments: [SegmentRecord]? = nil
     ) throws -> (entries: [VibeTokenEntry], events: [VibeSessionEvent]) {
         var entries: [VibeTokenEntry] = []
         var events: [VibeSessionEvent] = []
@@ -504,8 +631,8 @@ struct VibeSyncCodexParser: VibeLogParser {
         var prevTotal: [String: Double]?
         var prevCumulativeTotal: Double?
 
-        guard forEachLine(at: path, maxBytes: maxBytes, { line in
-            guard let object = parseObject(line) else { return true }
+        let handle: (SegmentRecord) -> Void = { record in
+            let object = record.object
             parsedRecordIndex += 1
 
             // A direct child task boundary covers every copied record. The
@@ -541,10 +668,10 @@ struct VibeSyncCodexParser: VibeLogParser {
                 if let payload, payload.keys.contains("service_tier") {
                     serviceTier = normalizeServiceTier(payload["service_tier"])
                 }
-                return true
+                return
             }
 
-            guard type == "event_msg", let payload else { return true }
+            guard type == "event_msg", let payload else { return }
             let payloadType = payload["type"] as? String
 
             if payloadType == "thread_settings_applied" {
@@ -553,17 +680,17 @@ struct VibeSyncCodexParser: VibeLogParser {
                 if let settings, settings.keys.contains("service_tier") {
                     serviceTier = normalizeServiceTier(settings["service_tier"])
                 }
-                return true
+                return
             }
 
-            guard payloadType == "token_count" else { return true }
+            guard payloadType == "token_count" else { return }
 
             // Raw ordinals advance before validating usage/timestamp so the
             // two passes cannot drift on a malformed copied token_count.
             let isReplayedHistory = inReplayBlock
             rawTokenSeen += 1
 
-            guard let info = payload["info"] as? [String: Any] else { return true }
+            guard let info = payload["info"] as? [String: Any] else { return }
             let totalUsage = info["total_token_usage"] as? [String: Any]
 
             // Codex sometimes writes the same token_count twice back-to-back.
@@ -605,13 +732,24 @@ struct VibeSyncCodexParser: VibeLogParser {
                     "reasoning_output_tokens": number(current["reasoning_output_tokens"]) ?? 0,
                 ]
             }
-            guard let usage else { return true }
-            if isReplayedHistory || isDuplicateEmission { return true }
+            guard let usage else { return }
+            if isReplayedHistory || isDuplicateEmission { return }
 
-            guard let eventTimestampMs = timestampMs(object["timestamp"]) else { return true }
+            guard let eventTimestampMs = timestampMs(object["timestamp"]) else { return }
 
-            let rawModel = nonEmpty(info["model"]) ?? nonEmpty(payload["model"]) ?? turnContextModel ?? "unknown"
-            let model = decorateModel(rawModel, serviceTier: serviceTier, timestampMs: eventTimestampMs)
+            // Merged segments carry the model/tier in effect where each
+            // token_count was written (JS obj._segmentContext); an explicit
+            // segment tier — even a cleared one — wins over the running
+            // default.
+            let rawModel = nonEmpty(info["model"]) ?? nonEmpty(payload["model"])
+                ?? record.context?.model ?? turnContextModel ?? "unknown"
+            let effectiveTier: String?
+            if let context = record.context, context.hasServiceTier {
+                effectiveTier = normalizeServiceTier(context.serviceTier)
+            } else {
+                effectiveTier = serviceTier
+            }
+            let model = decorateModel(rawModel, serviceTier: effectiveTier, timestampMs: eventTimestampMs)
 
             // OpenAI API: input_tokens INCLUDES cached, output_tokens
             // INCLUDES reasoning. Normalize to non-overlapping fields.
@@ -627,8 +765,16 @@ struct VibeSyncCodexParser: VibeLogParser {
                 outputTokens: (number(usage["output_tokens"]) ?? 0) - reasoningOutput,
                 cachedInputTokens: cachedInput,
                 reasoningOutputTokens: reasoningOutput))
-            return true
-        }) else { throw ParseError.unreadable(path) }
+        }
+
+        let completed: Bool
+        if let segments {
+            segments.forEach(handle)
+            completed = true
+        } else {
+            completed = forEachRecord(at: path, maxBytes: maxBytes, consume: handle)
+        }
+        guard completed else { throw ParseError.unreadable(path) }
 
         // Indexed files must match both passes exactly; a mismatch means the
         // rollout changed mid-sync and the next sync retries it.
@@ -652,6 +798,217 @@ struct VibeSyncCodexParser: VibeLogParser {
         guard model != "unknown", let serviceTier, timestampMs >= serviceTierAttributionStartMs
         else { return model }
         return "\(model)-\(serviceTier)"
+    }
+
+    // MARK: - Segment merging (codex-segments.js, upstream 84d007b)
+
+    /// One record of a (possibly merged) transcript. `tokenFingerprint` and
+    /// `context` are precomputed only for merged token_count records; records
+    /// read straight from a file hash the payload on demand and carry no
+    /// context.
+    private struct SegmentRecord {
+        let object: [String: Any]
+        var tokenFingerprint: String?
+        var context: SegmentContext?
+    }
+
+    /// Model/service-tier in effect where a token_count record was written.
+    /// `hasServiceTier` mirrors JS `Object.hasOwn(context, 'serviceTier')`: an
+    /// explicitly cleared tier in the segment wins over the running default.
+    private struct SegmentContext {
+        var model: String?
+        var serviceTier: String?
+        var hasServiceTier = false
+    }
+
+    private static let groupCacheKeyPrefix = "vibe-codex-segments://"
+
+    private static func groupCacheKey(for sessionId: String) -> String {
+        groupCacheKeyPrefix + sha256Hex(sessionId)
+    }
+
+    private static func isGroupCacheKey(_ key: String) -> Bool {
+        key.hasPrefix(groupCacheKeyPrefix)
+    }
+
+    private static func sha256Hex(_ string: String) -> String {
+        SHA256.hash(data: Data(string.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Merge exact cross-file copies with multiplicity: occurrence N of a
+    /// record in one file matches occurrence N in another, while repetitions
+    /// within a single file survive. Per-file adjacency constrains a
+    /// topological walk ordered by timestamp, with the first member's
+    /// session_meta pinned first. Returns nil on contradictory order or an
+    /// unreadable member — the caller marks the source skipped instead of
+    /// inventing a sequence that might double-count (JS mergeCodexSegments).
+    private static func mergeSegments(
+        members: [(path: String, snapshotSize: Int)]
+    ) -> [SegmentRecord]? {
+        final class Node {
+            let key: String
+            let record: SegmentRecord
+            let time: Double
+            let ordinal: Int
+            var successors: Set<String> = []
+            var incoming = 0
+
+            init(key: String, record: SegmentRecord, time: Double, ordinal: Int) {
+                self.key = key
+                self.record = record
+                self.time = time
+                self.ordinal = ordinal
+            }
+        }
+        var nodes: [String: Node] = [:]
+        var canonicalKey: String?
+        for (fileIndex, file) in members.enumerated() {
+            var occurrences: [String: Int] = [:]
+            var previous: String?
+            var context = SegmentContext()
+            let readable = forEachRecord(at: file.path, maxBytes: file.snapshotSize) { record in
+                let object = record.object
+                // Model/tier context rides on the records that set it and is
+                // snapshotted onto each token_count (JS _segmentContext).
+                let payload = object["payload"] as? [String: Any]
+                let settings: [String: Any]?
+                if object["type"] as? String == "turn_context" {
+                    settings = payload
+                } else if object["type"] as? String == "event_msg",
+                          payload?["type"] as? String == "thread_settings_applied" {
+                    settings = payload?["thread_settings"] as? [String: Any]
+                } else {
+                    settings = nil
+                }
+                if let model = nonEmpty(settings?["model"]) { context.model = model }
+                if let settings, settings.keys.contains("service_tier") {
+                    context.serviceTier = settings["service_tier"] as? String
+                    context.hasServiceTier = true
+                }
+                let fingerprint = recordFingerprint(object)
+                let occurrence = (occurrences[fingerprint] ?? 0) + 1
+                occurrences[fingerprint] = occurrence
+                let key = "\(fingerprint):\(occurrence)"
+                if fileIndex == 0, canonicalKey == nil, object["type"] as? String == "session_meta" {
+                    canonicalKey = key
+                }
+                if nodes[key] == nil {
+                    nodes[key] = Node(
+                        key: key, record: accountingRecord(object, context: context),
+                        time: timestampMs(object["timestamp"]) ?? .nan, ordinal: nodes.count)
+                }
+                if let previous, previous != key, let predecessor = nodes[previous],
+                   !predecessor.successors.contains(key) {
+                    predecessor.successors.insert(key)
+                    nodes[key]?.incoming += 1
+                }
+                previous = key
+            }
+            guard readable else { return nil }
+        }
+
+        var ready = nodes.values.filter { $0.incoming == 0 }
+        var result: [SegmentRecord] = []
+        while !ready.isEmpty {
+            ready.sort { first, second in
+                if first.key == canonicalKey || second.key == canonicalKey {
+                    return first.key == canonicalKey
+                }
+                if first.time.isFinite, second.time.isFinite, first.time != second.time {
+                    return first.time < second.time
+                }
+                return first.ordinal < second.ordinal
+            }
+            let node = ready.removeFirst()
+            result.append(node.record)
+            for key in node.successors {
+                guard let next = nodes[key] else { continue }
+                next.incoming -= 1
+                if next.incoming == 0 { ready.append(next) }
+            }
+        }
+        guard result.count == nodes.count else { return nil }
+        return result
+    }
+
+    private static let usageKeys = [
+        "input_tokens", "output_tokens", "cached_input_tokens",
+        "cache_read_input_tokens", "reasoning_output_tokens", "total_tokens",
+    ]
+
+    /// Retain only the fields the token/timing passes read; chat/tool text is
+    /// dropped here so a merged transcript never retains message content
+    /// (JS accountingRecord).
+    private static func accountingRecord(_ object: [String: Any], context: SegmentContext) -> SegmentRecord {
+        var reduced: [String: Any] = [:]
+        reduced["type"] = object["type"]
+        reduced["timestamp"] = object["timestamp"]
+        var fingerprint: String?
+        var recordContext: SegmentContext?
+        let payload = object["payload"] as? [String: Any]
+        switch object["type"] as? String {
+        case "session_meta":
+            if let payload {
+                var meta = pick(
+                    payload,
+                    keys: ["id", "timestamp", "cwd", "forked_from_id", "parent_thread_id", "thread_source"])
+                if let git = payload["git"], !(git is NSNull) {
+                    meta["git"] = (git as? [String: Any]).map { pick($0, keys: ["repository_url"]) } ?? git
+                }
+                if let source = payload["source"] as? String {
+                    meta["source"] = source
+                } else if let source = payload["source"] as? [String: Any], source.keys.contains("subagent") {
+                    let spawn = (source["subagent"] as? [String: Any])?["thread_spawn"] as? [String: Any]
+                    meta["source"] = ["subagent": ["thread_spawn": pick(spawn, keys: ["parent_thread_id"])]]
+                }
+                reduced["payload"] = meta
+            }
+        case "turn_context":
+            if let payload { reduced["payload"] = pick(payload, keys: ["model", "service_tier"]) }
+        case "event_msg":
+            if let payload {
+                var eventPayload = pick(payload, keys: ["type", "started_at", "model"])
+                if payload["type"] as? String == "token_count" {
+                    // Hash the FULL payload so the fingerprint matches
+                    // tokenFingerprint() computed on file-read records.
+                    fingerprint = tokenFingerprint(payload)
+                    recordContext = context
+                    if let info = payload["info"] as? [String: Any] {
+                        var reducedInfo = pick(info, keys: ["model"])
+                        if let total = info["total_token_usage"] as? [String: Any] {
+                            reducedInfo["total_token_usage"] = pick(total, keys: usageKeys)
+                        }
+                        if let last = info["last_token_usage"] as? [String: Any] {
+                            reducedInfo["last_token_usage"] = pick(last, keys: usageKeys)
+                        }
+                        eventPayload["info"] = reducedInfo
+                    }
+                } else if payload["type"] as? String == "thread_settings_applied",
+                          let settings = payload["thread_settings"] as? [String: Any] {
+                    eventPayload["thread_settings"] = pick(settings, keys: ["model", "service_tier"])
+                }
+                reduced["payload"] = eventPayload
+            }
+        default:
+            break
+        }
+        return SegmentRecord(object: reduced, tokenFingerprint: fingerprint, context: recordContext)
+    }
+
+    private static func pick(_ value: [String: Any]?, keys: [String]) -> [String: Any] {
+        guard let value else { return [:] }
+        var result: [String: Any] = [:]
+        for key in keys where value.keys.contains(key) { result[key] = value[key] }
+        return result
+    }
+
+    /// Whole-record hash identifying an exact cross-file copy. Only ever
+    /// compared against hashes produced here, so sorted-keys serialization is
+    /// fine (JS hashes JSON.stringify output).
+    private static func recordFingerprint(_ object: [String: Any]) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        else { return "" }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: - Sequence matching (KMP, ported verbatim in spirit)
@@ -714,6 +1071,10 @@ struct VibeSyncCodexParser: VibeLogParser {
     private struct FileSignature: Equatable, Sendable {
         let size: Int
         let mtime: TimeInterval
+        // Merged continuation groups add a hash of the member list so a
+        // membership change that preserves total size and max mtime still
+        // invalidates the group cache (JS codexSegmentSignature's ino hash).
+        var tag: String? = nil
     }
 
     private struct CachedFile: Sendable {
@@ -772,6 +1133,18 @@ struct VibeSyncCodexParser: VibeLogParser {
     private static func parseObject(_ line: Data) -> [String: Any]? {
         autoreleasepool {
             try? JSONSerialization.jsonObject(with: line) as? [String: Any]
+        }
+    }
+
+    /// Parse each JSONL line into a SegmentRecord, skipping unparseable lines
+    /// (like both JS passes). Returns false on I/O failure.
+    private static func forEachRecord(
+        at path: String, maxBytes: Int, consume: (SegmentRecord) -> Void
+    ) -> Bool {
+        forEachLine(at: path, maxBytes: maxBytes) { line in
+            guard let object = parseObject(line) else { return true }
+            consume(SegmentRecord(object: object))
+            return true
         }
     }
 

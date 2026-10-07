@@ -13,6 +13,14 @@ struct VibeTokenEntry: Sendable, Equatable {
     var outputTokens: Double
     var cachedInputTokens: Double
     var reasoningOutputTokens: Double
+    // Prompt-cache *writes*, split by TTL (Anthropic prices them at 1.25x/2x
+    // the base input rate, so they travel as their own columns instead of
+    // being folded into inputTokens). Parsers that cannot tell the two TTLs
+    // apart leave these at 0 and keep folding cache writes into inputTokens.
+    var cacheCreation5mTokens: Double = 0
+    var cacheCreation1hTokens: Double = 0
+    // Account-wide cloud exports must use the upstream's shared device key.
+    var hostname: String? = nil
 }
 
 enum VibeSessionRole: String, Sendable {
@@ -36,7 +44,7 @@ struct VibeParseResult: Sendable, Equatable {
 
 protocol VibeLogParser: Sendable {
     var source: String { get }
-    func parse() throws -> VibeParseResult
+    func parse() async throws -> VibeParseResult
 }
 
 // MARK: - Wire shapes
@@ -51,6 +59,8 @@ struct VibeBucket: Codable, Equatable, Sendable {
     var outputTokens: Int
     var cachedInputTokens: Int
     var reasoningOutputTokens: Int
+    var cacheCreation5mTokens: Int = 0
+    var cacheCreation1hTokens: Int = 0
     var totalTokens: Int
 }
 
@@ -145,10 +155,13 @@ enum VibeAggregation {
             var output = 0.0
             var cached = 0.0
             var reasoning = 0.0
+            var cacheCreation5m = 0.0
+            var cacheCreation1h = 0.0
         }
         var map: [String: Accumulator] = [:]
         var order: [String] = []
         for entry in entries {
+            let hostname = entry.hostname ?? hostname
             let model = truncate(entry.model, fallback: "unknown", maxLength: modelMaxLength)
             let project = truncate(entry.project, fallback: "unknown", maxLength: projectMaxLength)
             let bucketStart = VibeSyncTime.isoString(VibeSyncTime.roundToHalfHour(entry.timestamp))
@@ -164,6 +177,8 @@ enum VibeAggregation {
             map[key]!.output += entry.outputTokens.isFinite ? entry.outputTokens : 0
             map[key]!.cached += entry.cachedInputTokens.isFinite ? entry.cachedInputTokens : 0
             map[key]!.reasoning += entry.reasoningOutputTokens.isFinite ? entry.reasoningOutputTokens : 0
+            map[key]!.cacheCreation5m += entry.cacheCreation5mTokens.isFinite ? entry.cacheCreation5mTokens : 0
+            map[key]!.cacheCreation1h += entry.cacheCreation1hTokens.isFinite ? entry.cacheCreation1hTokens : 0
         }
         // Clamp after summation so sub-integer token counts accumulate like the JS version.
         return order.map { key in
@@ -173,7 +188,15 @@ enum VibeAggregation {
             bucket.outputTokens = toTokenCount(acc.output)
             bucket.cachedInputTokens = toTokenCount(acc.cached)
             bucket.reasoningOutputTokens = toTokenCount(acc.reasoning)
+            bucket.cacheCreation5mTokens = toTokenCount(acc.cacheCreation5m)
+            bucket.cacheCreation1hTokens = toTokenCount(acc.cacheCreation1h)
+            // Cache writes stay inside totalTokens: they used to arrive folded
+            // into inputTokens, and the server uses this field only as a `> 0`
+            // liveness filter. Keeping them in makes the number bit-identical
+            // to what the same logs produced before the split, so no bucket
+            // drops out of any view.
             bucket.totalTokens = bucket.inputTokens + bucket.outputTokens + bucket.reasoningOutputTokens
+                + bucket.cacheCreation5mTokens + bucket.cacheCreation1hTokens
             return bucket
         }
     }
@@ -191,7 +214,9 @@ enum VibeAggregation {
                 timestamp: timestamp,
                 inputTokens: Double(bucket.inputTokens), outputTokens: Double(bucket.outputTokens),
                 cachedInputTokens: Double(bucket.cachedInputTokens),
-                reasoningOutputTokens: Double(bucket.reasoningOutputTokens)))
+                reasoningOutputTokens: Double(bucket.reasoningOutputTokens),
+                cacheCreation5mTokens: Double(bucket.cacheCreation5mTokens),
+                cacheCreation1hTokens: Double(bucket.cacheCreation1hTokens)))
         }
         return hostnameOrder.flatMap { aggregateToBuckets(byHostname[$0] ?? [], hostname: $0) }
     }
@@ -282,6 +307,10 @@ enum VibeSyncHashing {
             String(bucket.inputTokens), String(bucket.outputTokens),
             String(bucket.cachedInputTokens), String(bucket.reasoningOutputTokens),
             String(bucket.totalTokens),
+            // Cache writes carry a different unit price per TTL, so a bucket
+            // whose only change is a 5m<->1h reclassification must still
+            // re-upload — totalTokens alone cannot see that move.
+            String(bucket.cacheCreation5mTokens), String(bucket.cacheCreation1hTokens),
         ])
     }
 
@@ -301,9 +330,37 @@ enum VibeSyncHashing {
 
 // MARK: - Incremental state (~/.vibe-usage/state.json, shared with the official CLI)
 
+// The upload target a state file belongs to: which server, and which account
+// on it. state.json only records what was already uploaded *to that target*, so
+// after a re-bind (new apiKey/apiUrl in config.json) the old hashes must not
+// make sync skip history the new account has never received.
+//
+// The key is stored only as a fingerprint — sha256(apiKey) hex, first 16 chars,
+// same as the official CLI's stateIdentity(). The raw apiKey must never appear
+// in state.json; config.json remains the only place it lives.
+struct VibeSyncStateIdentity: Codable, Equatable, Sendable {
+    var apiUrl: String
+    var keyFingerprint: String
+
+    init(apiURL: String, apiKey: String) {
+        self.apiUrl = apiURL
+        self.keyFingerprint = VibeSyncHashing.sha256Hex16(apiKey)
+    }
+}
+
 struct VibeSyncState: Codable, Equatable, Sendable {
     var buckets: [String: String] = [:]
     var sessions: [String: String] = [:]
+    // nil in files written before the identity existed; adopted as-is on load.
+    var identity: VibeSyncStateIdentity?
+
+    // Runtime-only signal from load(identity:): the file was bound to another
+    // upload target and its entries were discarded. Never persisted.
+    var identityChanged = false
+
+    private enum CodingKeys: String, CodingKey {
+        case buckets, sessions, identity
+    }
 
     // Drop keys the parsers no longer emit, scoped to sources whose parser ran
     // to completion this sync — a failing parser must not evict its own state.
@@ -329,11 +386,21 @@ struct VibeSyncStateStore: Sendable {
     let fileURL: URL
 
     // Missing/corrupt state reads as empty, which triggers a one-time full upload.
-    func load() -> VibeSyncState {
+    //
+    // Passing an identity binds the file to its upload target (matching the
+    // official CLI's loadState(identity)):
+    // - file has no identity (written by an older version) → adopted as-is,
+    //   not force-emptied; the next save stamps the current identity.
+    // - identity matches → entries returned unchanged.
+    // - identity differs (re-bound account/server) → empty state with
+    //   identityChanged set, so the next sync re-uploads the local history.
+    func load(identity: VibeSyncStateIdentity? = nil) -> VibeSyncState {
         guard let data = try? Data(contentsOf: fileURL),
               let state = try? JSONDecoder().decode(VibeSyncState.self, from: data)
         else { return VibeSyncState() }
-        return state
+        guard let identity, let recorded = state.identity else { return state }
+        if recorded == identity { return state }
+        return VibeSyncState(identityChanged: true)
     }
 
     // Atomic replace: JSONEncoder writes a temp file and renames over the target.

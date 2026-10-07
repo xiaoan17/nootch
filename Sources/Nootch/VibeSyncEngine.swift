@@ -30,13 +30,54 @@ struct VibeSyncReport: Sendable, Equatable {
 // MARK: - Sync engine
 
 actor VibeSyncEngine {
-    static let shared = VibeSyncEngine(parsers: [
+    private struct ParserJob: Sendable {
+        let index: Int
+        let source: String
+        let parser: any VibeLogParser
+    }
+    private struct ParserOutcome: Sendable {
+        let index: Int
+        let source: String
+        let result: Result<VibeParseResult, Error>
+    }
+    static let shared = VibeSyncEngine(parsers: defaultParsers())
+
+    static func defaultParsers() -> [any VibeLogParser] { [
         VibeClaudeCodeParser(),
         VibeSyncCodexParser(),
         VibeKimiCodeParser(),
         VibeGrokParser(),
         VibePiParser(),
-    ])
+        VibeCodeBuddyParser(),
+        VibeSyncCodeArtsParser(),
+        VibeSyncDevinParser(),
+        VibeSyncMcodeParser(),
+        VibeSyncOpenCodeParser(),
+        VibeSyncAlmaParser(),
+        VibeSyncAmpParser(),
+        VibeSyncAntigravityParser(),
+        VibeSyncClineParser(),
+        VibeSyncClineParser(roo: true),
+        VibeColaParser(),
+        VibeCopilotCliParser(),
+        VibeCraftAgentParser(),
+        VibeSyncCursorParser(),
+        VibeSyncDimagentParser(),
+        VibeSyncDroidParser(),
+        VibeSyncDshParser(),
+        VibeGeminiCliParser(),
+        VibeSyncHermesParser(),
+        VibeSyncKiroParser(),
+        VibeSyncMimocodeParser(),
+        VibeOmpParser(),
+        VibeOpenClawParser(),
+        VibeSyncQoderParser(edition: .international),
+        VibeSyncQoderParser(edition: .cn),
+        VibeQwenCodeParser(),
+        VibeTraeCLIParser(),
+        VibeWorkBuddyParser(),
+        VibeSyncZcodeParser(),
+    ] }
 
     static let bucketBatchSize = 100
     static let sessionBatchSize = 500
@@ -82,7 +123,7 @@ actor VibeSyncEngine {
             logger.error("vibe sync: API key rejected (401)")
         } catch {
             report.status = .failed
-            report.error = error.localizedDescription
+            report.error = (error as? VibeSQLiteError)?.message ?? error.localizedDescription
             logger.error("vibe sync failed: \(error.localizedDescription, privacy: .public)")
         }
         if report.status == .synced || report.status == .dryRun {
@@ -103,6 +144,12 @@ actor VibeSyncEngine {
         }
         let configuredURL = (config["apiUrl"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let apiURL = configuredURL.isEmpty ? VibeUsageAdapter.defaultAPIURL : configuredURL
+        // state.json records what was already uploaded to *this* account on
+        // *this* server; loading with the identity makes state left by a
+        // previous account fall away so a re-bind re-uploads the local history.
+        // Built from the same apiURL/apiKey the ingest calls use, so the
+        // recorded target and the actual target can never drift apart.
+        let identity = VibeSyncStateIdentity(apiURL: apiURL, apiKey: apiKey)
         let client = VibeSyncAPIClient(baseURL: apiURL, apiKey: apiKey, dataLoader: dataLoader, sleep: sleep, random: random)
 
         // Privacy is a required input: on settings outage reuse the cached choice
@@ -126,36 +173,56 @@ actor VibeSyncEngine {
         }
 
         // Run parsers concurrently; a failing or skipped parser never blocks the rest.
+        // Carry attribution in a named value across the async existential call.
+        // The release regression covers mixed synchronous/asynchronous witnesses;
+        // the former anonymous tuple lost job indices in that configuration.
+        let jobs = parsers.enumerated().map { ParserJob(index: $0.offset, source: $0.element.source, parser: $0.element) }
         let outcomes = await withTaskGroup(
-            of: (Int, Result<VibeParseResult, Error>).self,
-            returning: [(Int, Result<VibeParseResult, Error>)].self)
+            of: ParserOutcome.self,
+            returning: [ParserOutcome].self)
         { group in
-            for (index, parser) in parsers.enumerated() {
-                group.addTask { (index, Result { try parser.parse() }) }
+            for job in jobs {
+                group.addTask {
+                    let result: Result<VibeParseResult, Error>
+                    do { result = .success(try await job.parser.parse()) }
+                    catch { result = .failure(error) }
+                    return ParserOutcome(index: job.index, source: job.source, result: result)
+                }
             }
-            var collected: [(Int, Result<VibeParseResult, Error>)] = []
+            var collected: [ParserOutcome] = []
             for await outcome in group { collected.append(outcome) }
-            return collected.sorted { $0.0 < $1.0 }
+            return collected.sorted { $0.index < $1.index }
         }
 
+        guard outcomes.count == parsers.count,
+              Set(outcomes.map(\.index)) == Set(parsers.indices),
+              outcomes.map(\.source) == jobs.map(\.source) else {
+            throw VibeSQLiteError(message: "Incomplete parser results: expected \(parsers.count), got \(outcomes.map(\.index))")
+        }
         var allEntries: [VibeTokenEntry] = []
         var allEvents: [VibeSessionEvent] = []
         var okSources = Set<String>()
-        for (index, outcome) in outcomes {
-            let source = parsers[index].source
-            switch outcome {
+        for outcome in outcomes {
+            let source = outcome.source
+            switch outcome.result {
             case .failure(let error):
                 report.failedSources.append(source)
                 logger.error("vibe sync parser \(source, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
             case .success(let result):
                 if !result.skipped { okSources.insert(source) }
+                else { report.failedSources.append(source) }
                 allEntries.append(contentsOf: result.entries)
                 allEvents.append(contentsOf: result.events)
             }
         }
         report.okSources = okSources.sorted()
 
-        var state = stateStore.load()
+        var state = stateStore.load(identity: identity)
+        if state.identityChanged {
+            logger.info("vibe sync: upload account changed, re-uploading full local history")
+        }
+        // Stamp every save with the current target, so a later re-bind is caught.
+        state.identity = identity
 
         if allEntries.isEmpty, allEvents.isEmpty {
             // Even with nothing live, dead keys of successful parsers must be pruned.
@@ -243,9 +310,10 @@ actor VibeSyncEngine {
                 report.uploadedBuckets += response.ingested ?? batch.count
                 report.uploadedSessions += response.sessions ?? 0
                 report.droppedBuckets += response.dropped?.buckets ?? 0
-                // Buckets of a source the server rejected stay uncommitted so
-                // the next sync retries them.
                 let unknownSources = Set(response.dropped?.unknownSources ?? [])
+                // Same uncommitted-on-drop rule for buckets and sessions: an
+                // item the backend rejected for an unknown source is retried on
+                // the next sync rather than permanently lost.
 
                 var stateChanged = false
                 for bucket in batch where !unknownSources.contains(bucket.source) {
@@ -255,7 +323,7 @@ actor VibeSyncEngine {
                         stateChanged = true
                     }
                 }
-                for session in batchSessions {
+                for session in batchSessions where !unknownSources.contains(session.source) {
                     let key = VibeSyncHashing.sessionKey(session)
                     if let hash = pendingSessionState[key] {
                         state.sessions[key] = hash

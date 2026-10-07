@@ -36,11 +36,29 @@ fi
 # sticking. ResourceBundle.swift looks here instead.
 cp -R "$BUNDLE" "$DIST/$APP_NAME.app/Contents/Resources/"
 
+# DSH uses multi-frame Zstandard. Bundle the public libzstd ABI so the installed
+# app works without Homebrew/Node. Override for Intel or custom build machines.
+ZSTD_LIBRARY_PATH="${ZSTD_LIBRARY_PATH:-/opt/homebrew/lib/libzstd.1.dylib}"
+if [ ! -f "$ZSTD_LIBRARY_PATH" ]; then
+    echo "error: set ZSTD_LIBRARY_PATH to a libzstd.1.dylib for this architecture" >&2
+    exit 1
+fi
+mkdir -p "$DIST/$APP_NAME.app/Contents/Frameworks"
+cp -L "$ZSTD_LIBRARY_PATH" "$DIST/$APP_NAME.app/Contents/Frameworks/libzstd.1.dylib"
+install_name_tool -id '@rpath/libzstd.1.dylib' "$DIST/$APP_NAME.app/Contents/Frameworks/libzstd.1.dylib"
+cp "$ROOT/packaging/ZSTD-LICENSE" "$DIST/$APP_NAME.app/Contents/Resources/ZSTD-LICENSE"
+
 # Sign with a real Developer ID when one is available, so the app has a stable
 # code signing identity across releases. Keychain ACL entries are keyed on that
 # identity; an ad-hoc signature falls back to the binary's cdhash, which changes
 # on every build and silently voids any previous "Always Allow" grant.
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+# Sign executable dependencies before sealing the enclosing app.
+if [ "$CODESIGN_IDENTITY" = "-" ]; then
+    codesign --force --sign - "$DIST/$APP_NAME.app/Contents/Frameworks/libzstd.1.dylib"
+else
+    codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$DIST/$APP_NAME.app/Contents/Frameworks/libzstd.1.dylib"
+fi
 # --deep is deprecated by Apple and unnecessary here: the only nested bundle is
 # nootch_Nootch.bundle, which holds resources and no executable code, so it is
 # covered by the app's own resource seal.

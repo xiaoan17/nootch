@@ -1,0 +1,7 @@
+[
+  {
+    "id": "task",
+    "cwd": "/repo/project",
+    "modelId": "fallback"
+  }
+]

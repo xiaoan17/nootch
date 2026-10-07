@@ -1,0 +1,2 @@
+# Preserve the Windows-style export used by the Cursor CRLF regression fixture.
+Tests/Fixtures/remaining-parsers/cursor.csv -text whitespace=cr-at-eol

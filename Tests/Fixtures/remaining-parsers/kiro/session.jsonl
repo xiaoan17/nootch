@@ -1,0 +1,4 @@
+{"kind":"Prompt","data":{"meta":{"timestamp":1767225600},"content":[{"kind":"text","data":"12345678"}]}}
+{"kind":"AssistantMessage","data":{"content":[{"kind":"thinking","data":{"text":"12345678","signature":"1234567890123456","modelId":"claude"}},{"kind":"text","data":"1234"}]}}
+{"kind":"ToolResults","data":{"content":[{"data":"12345678"}]}}
+{"kind":"AssistantMessage","data":{"content":[{"kind":"text","data":"1234"}]}}

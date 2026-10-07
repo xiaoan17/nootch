@@ -16,6 +16,8 @@ struct NootchApp: App {
         let dryRun = arguments.contains("--vibe-sync-dry-run")
         guard dryRun || arguments.contains("--vibe-sync") else { return }
         Task {
+            let sources = await VibeSyncEngine.shared.parsers.map(\.source)
+            print("vibe-sync registered \(sources.count): \(sources.joined(separator: ", "))")
             let report = await VibeSyncEngine.shared.sync(dryRun: dryRun)
             print("vibe-sync \(report.status.rawValue): live \(report.liveBuckets) buckets / \(report.liveSessions) sessions,"
                 + " changed \(report.changedBuckets) / \(report.changedSessions),"
@@ -53,6 +55,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var store: UsageStore?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // One-shot diagnostics must not also start the normal background sync.
+        if CommandLine.arguments.contains("--vibe-sync") || CommandLine.arguments.contains("--vibe-sync-dry-run") { return }
         AppSettings.configure()
         // Installed apps use CFBundleIconFile for the Dock and app switcher.
         // A runtime override is only needed for the bare SwiftPM executable.

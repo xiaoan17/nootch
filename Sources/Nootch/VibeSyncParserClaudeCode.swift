@@ -11,12 +11,37 @@ import Synchronization
 /// Roots (first match wins, JS getClaudeRoots): VIBE_USAGE_CLAUDE_DIRS
 /// (path-list separator ":", tests / diagnostics) replaces all discovery; else
 /// ~/.claude, $CLAUDE_CONFIG_DIR, and data-bearing ~/.claude-* profile dirs.
+/// Explicit `extraRoots` (e.g. another OS's .claude directory, upstream 22cef3d)
+/// are appended after discovery. Each extra root is validated like the JS
+/// `validateExtraRoot('claude-code', …)`: it must contain a readable
+/// projects/ or transcripts/ directory, otherwise the result is marked
+/// skipped (JS warning → state protection) so incremental state is never
+/// pruned on the basis of a half-visible store.
 ///
-/// Token mapping: inputTokens = input_tokens + max(cache_creation_input_tokens,
-/// ephemeral_5m + ephemeral_1h breakdown), cachedInputTokens =
-/// cache_read_input_tokens, outputTokens = output_tokens, reasoning = 0. Model
-/// is message.model; "<synthetic>"/missing falls back to the session's last
-/// real model, then "claude-unknown". All-zero usage rows emit nothing.
+/// Before scanning, every root is checked to actually be a directory
+/// (upstream 5387113): a root that exists but is not a directory marks the
+/// result skipped, so an invalid store cannot look like a successful empty
+/// scan and let incremental state be pruned. Missing roots stay silent and
+/// harmless (optional default stores).
+///
+/// Token mapping: inputTokens = input_tokens (cache writes are NOT folded in;
+/// Anthropic prices them at 1.25x/2x the base input rate per TTL), cachedInputTokens =
+/// cache_read_input_tokens, outputTokens = output_tokens, reasoning = 0.
+/// Cache creation splits by TTL: cacheCreation5mTokens / cacheCreation1hTokens
+/// come from the cache_creation ephemeral_5m/ephemeral_1h breakdown; when the
+/// breakdown is missing or short of cache_creation_input_tokens, the
+/// unexplained remainder goes to the cheaper 5m bucket, so a partial log can
+/// only under-state cost (upstream e9ae391). Model is message.model;
+/// "<synthetic>"/missing falls back to the session's last real model, then
+/// "claude-unknown". All-zero usage rows emit nothing.
+///
+/// Fast mode (research preview, Claude Opus 5 / Opus 4.8) is billed at 2x the
+/// standard input and output rate. Claude Code records it as
+/// `message.usage.speed` ('standard' | 'fast'); the server pricing map keys the
+/// premium rate off a trailing `-fast` marker (TIER_MARKER_SUFFIX →
+/// tiers.priority) and falls back to the base rate for models with no
+/// published priority tier, so the marker is safe to append unconditionally
+/// (upstream e9ae391).
 ///
 /// Dedupe: one API call is written as several assistant lines (one per content
 /// block, plus an early streaming partial) sharing message.id/requestId; the
@@ -42,13 +67,52 @@ import Synchronization
 struct VibeClaudeCodeParser: VibeLogParser {
     let source = "claude-code"
     private let roots: [String]
+    // JS warnings collapse into `skipped: true`; an invalid extra root is one
+    // such warning, produced at construction because roots are fixed then.
+    private let hasInvalidExtraRoot: Bool
 
-    init(roots: [String]? = nil, environment: [String: String] = ProcessInfo.processInfo.environment) {
-        if let roots {
-            self.roots = roots
-            return
+    init(
+        roots: [String]? = nil,
+        extraRoots: [String] = [],
+        environment: [String: String] = ProcessInfo.processInfo.environment)
+    {
+        var discovered = roots ?? Self.discoverRoots(environment: environment)
+        var invalidExtraRoot = false
+        // Explicit extra roots are additive, appended even when invalid — the
+        // invalid one contributes nothing but still flags the run skipped,
+        // matching JS getClaudeRoots + validateExtraRoot.
+        for extraRoot in extraRoots {
+            let validation = Self.validateExtraRoot(extraRoot)
+            if !validation.ok { invalidExtraRoot = true }
+            discovered.append(validation.path)
         }
-        self.roots = Self.discoverRoots(environment: environment)
+        // Re-run canonical dedupe across the combined list (JS dedupes after
+        // appending extra roots, so a duplicate of a discovered root or of
+        // another extra root collapses).
+        var seen = Set<String>()
+        var unique: [String] = []
+        for root in discovered {
+            let canonical = (root as NSString).resolvingSymlinksInPath
+            guard !seen.contains(canonical) else { continue }
+            seen.insert(canonical)
+            unique.append(root)
+        }
+        self.roots = unique
+        self.hasInvalidExtraRoot = invalidExtraRoot
+    }
+
+    /// JS validateExtraRoot('claude-code', …): expand ~, then require a
+    /// readable projects/ or transcripts/ directory inside the root.
+    static func validateExtraRoot(_ value: String) -> (path: String, ok: Bool) {
+        let path = expandHome(value)
+        let ok = ["projects", "transcripts"].contains { name in
+            var isDirectory: ObjCBool = false
+            let candidate = path + "/" + name
+            return FileManager.default.fileExists(atPath: candidate, isDirectory: &isDirectory)
+                && isDirectory.boolValue
+                && FileManager.default.isReadableFile(atPath: candidate)
+        }
+        return (path, ok)
     }
 
     // MARK: - Root discovery (claude-roots.js)
@@ -145,7 +209,9 @@ struct VibeClaudeCodeParser: VibeLogParser {
     /// Group files by logical session id across roots and order each group by
     /// completeness: larger size, then newer mtime, then lexicographic path
     /// (JS collectCandidates / candidateIsBetter).
-    private func collectCandidates(directoryName: String, incomplete: inout Bool) -> [(String, [Candidate])] {
+    private func collectCandidates(
+        roots: [String], directoryName: String, incomplete: inout Bool
+    ) -> [(String, [Candidate])] {
         var groups: [String: [Candidate]] = [:]
         var order: [String] = []
         for root in roots {
@@ -291,12 +357,17 @@ struct VibeClaudeCodeParser: VibeLogParser {
             let rawModel = (message["model"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
             let modelIsReal = !rawModel.isEmpty && rawModel != "<synthetic>"
             if modelIsReal { lastModel = rawModel }
-            let model = modelIsReal ? rawModel : (lastModel ?? "claude-unknown")
+            let baseModel = modelIsReal ? rawModel : (lastModel ?? "claude-unknown")
+            let model = Self.applySpeedMarker(baseModel, fast: Self.isFastMode(usage, message: message))
 
-            let inputTokens = Self.toCount(usage["input_tokens"]) + Self.cacheCreationTokens(usage)
+            let inputTokens = Self.toCount(usage["input_tokens"])
             let outputTokens = Self.toCount(usage["output_tokens"])
             let cachedInputTokens = Self.toCount(usage["cache_read_input_tokens"])
+            let cacheCreation = Self.cacheCreationSplit(usage)
+            // Unchanged from when cache writes lived inside inputTokens, so the
+            // "keep the most complete duplicate" ranking keeps its old ordering.
             let usageScore = inputTokens + outputTokens + cachedInputTokens
+                + cacheCreation.fiveMinute + cacheCreation.oneHour
             // Synthetic bookkeeping rows carry zero usage and would only
             // inflate bucket counts the server discards anyway.
             guard usageScore > 0 else { return }
@@ -312,7 +383,9 @@ struct VibeClaudeCodeParser: VibeLogParser {
                     inputTokens: inputTokens,
                     outputTokens: outputTokens,
                     cachedInputTokens: cachedInputTokens,
-                    reasoningOutputTokens: 0)))
+                    reasoningOutputTokens: 0,
+                    cacheCreation5mTokens: cacheCreation.fiveMinute,
+                    cacheCreation1hTokens: cacheCreation.oneHour)))
         }
         guard scanned else { return nil }
         // A cwd can appear after initial metadata/messages: normalize the
@@ -361,14 +434,44 @@ struct VibeClaudeCodeParser: VibeLogParser {
         return nil
     }
 
-    /// max(total, TTL breakdown): current logs carry both, max avoids
-    /// double-counting while tolerating partially populated logs.
-    private static func cacheCreationTokens(_ usage: [String: Any]) -> Double {
+    /// Cache-creation (prompt-cache write) tokens, split by TTL
+    /// (JS cacheCreationSplit, upstream e9ae391).
+    ///
+    /// Anthropic bills the two TTLs at different multiples of the base input
+    /// rate (5-minute writes 1.25x, 1-hour writes 2x), so the split is a
+    /// price-changing dimension and has to survive to the server. When the
+    /// TTL breakdown is missing, or adds up to less than the
+    /// cache_creation_input_tokens total, the unexplained remainder is booked
+    /// to the **5m** bucket — the cheaper multiplier, so a partially populated
+    /// log can only under-state cost. This preserves the old
+    /// max(direct, split) total exactly; only its attribution is new.
+    private static func cacheCreationSplit(_ usage: [String: Any]) -> (fiveMinute: Double, oneHour: Double) {
         let direct = toCount(usage["cache_creation_input_tokens"])
         let breakdown = usage["cache_creation"] as? [String: Any] ?? [:]
-        let split = toCount(breakdown["ephemeral_5m_input_tokens"])
-            + toCount(breakdown["ephemeral_1h_input_tokens"])
-        return max(direct, split)
+        let fiveMinute = toCount(breakdown["ephemeral_5m_input_tokens"])
+        let oneHour = toCount(breakdown["ephemeral_1h_input_tokens"])
+        let split = fiveMinute + oneHour
+        if split >= direct { return (fiveMinute, oneHour) }
+        return (fiveMinute + (direct - split), oneHour)
+    }
+
+    /// JS isFastMode: usage.speed ?? message.speed === 'fast' (trimmed,
+    /// case-insensitive). JSON null falls through to the message-level field.
+    private static func isFastMode(_ usage: [String: Any], message: [String: Any]) -> Bool {
+        func speedValue(_ container: [String: Any]) -> Any? {
+            guard let value = container["speed"], !(value is NSNull) else { return nil }
+            return value
+        }
+        guard let speed = (speedValue(usage) ?? speedValue(message)) as? String else { return false }
+        return speed.trimmingCharacters(in: .whitespaces).lowercased() == "fast"
+    }
+
+    /// The server pricing map keys the premium rate off a trailing `-fast`
+    /// marker; a model with no published priority tier falls back to its base
+    /// rate server-side, so the marker is safe to append unconditionally.
+    private static func applySpeedMarker(_ model: String, fast: Bool) -> String {
+        guard fast, !model.isEmpty else { return model }
+        return model.hasSuffix("-fast") ? model : model + "-fast"
     }
 
     /// JS timingEvent: user lines are user turns; assistant/tool_use/
@@ -467,10 +570,24 @@ struct VibeClaudeCodeParser: VibeLogParser {
 
     func parse() throws -> VibeParseResult {
         var result = VibeParseResult()
-        var incomplete = false
+        var incomplete = hasInvalidExtraRoot
         var merged = ParsedFile()
 
-        let projectGroups = collectCandidates(directoryName: "projects", incomplete: &incomplete)
+        // Validate each root before scanning (upstream 5387113): on some
+        // platforms reading "<file>/projects" fails the same way as a missing
+        // directory, so an invalid store could pass as a successful empty scan
+        // and let incremental state be pruned. A root that exists but is not a
+        // directory flags the run skipped; a missing root stays silent.
+        let scanRoots = roots.filter { root in
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: root, isDirectory: &isDirectory) else {
+                return false
+            }
+            if !isDirectory.boolValue { incomplete = true }
+            return isDirectory.boolValue
+        }
+
+        let projectGroups = collectCandidates(roots: scanRoots, directoryName: "projects", incomplete: &incomplete)
         var projectSessionIds = Set<String>()
         for (sessionId, candidates) in projectGroups {
             guard let parsed = scanBestCandidate(candidates, kind: .projects, incomplete: &incomplete)
@@ -482,7 +599,7 @@ struct VibeClaudeCodeParser: VibeLogParser {
         }
 
         // Transcripts add session timing only for sessions projects/ lacks.
-        let transcriptGroups = collectCandidates(directoryName: "transcripts", incomplete: &incomplete)
+        let transcriptGroups = collectCandidates(roots: scanRoots, directoryName: "transcripts", incomplete: &incomplete)
         for (sessionId, candidates) in transcriptGroups where !projectSessionIds.contains(sessionId) {
             guard let parsed = scanBestCandidate(candidates, kind: .transcripts, incomplete: &incomplete)
             else { continue }

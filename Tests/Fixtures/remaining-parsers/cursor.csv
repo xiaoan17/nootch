@@ -1,0 +1,2 @@
+Date,Model,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens
+2026-01-01,"model,fast","1,000",20,50,10

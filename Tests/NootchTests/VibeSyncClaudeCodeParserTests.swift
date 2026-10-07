@@ -37,12 +37,16 @@ struct VibeSyncClaudeCodeParserTests {
         cacheCreation: Int = 0,
         cacheRead: Int = 0,
         cacheCreationBreakdown: (fiveMin: Int, oneHour: Int)? = nil,
+        speed: String? = nil,
         cwd: String? = "/Users/x/alpha",
         uuid: String = UUID().uuidString) -> String
     {
         var usage = "\"input_tokens\":\(input),\"output_tokens\":\(output),\"cache_creation_input_tokens\":\(cacheCreation),\"cache_read_input_tokens\":\(cacheRead)"
         if let breakdown = cacheCreationBreakdown {
             usage += ",\"cache_creation\":{\"ephemeral_5m_input_tokens\":\(breakdown.fiveMin),\"ephemeral_1h_input_tokens\":\(breakdown.oneHour)}"
+        }
+        if let speed {
+            usage += ",\"speed\":\"\(speed)\""
         }
         return """
         {"type":"assistant","timestamp":"\(timestamp)","cwd":\(cwd.map { "\"\($0)\"" } ?? "null"),"sessionId":"sid","uuid":"\(uuid)","requestId":\(requestId.map { "\"\($0)\"" } ?? "null"),"message":{"id":\(id.map { "\"\($0)\"" } ?? "null"),"model":\(model.map { "\"\($0)\"" } ?? "null"),"role":"assistant","usage":{\(usage)}}}
@@ -69,7 +73,9 @@ struct VibeSyncClaudeCodeParserTests {
         #expect(entry.model == "claude-opus-4-1")
         #expect(entry.project == "alpha")
         #expect(entry.timestamp == date("2026-09-01T10:00:05.000Z"))
-        #expect(entry.inputTokens == 120)  // input_tokens + cache_creation
+        #expect(entry.inputTokens == 100)  // cache creation is NOT folded in (upstream e9ae391)
+        #expect(entry.cacheCreation5mTokens == 20)  // no TTL breakdown → remainder to the cheaper 5m bucket
+        #expect(entry.cacheCreation1hTokens == 0)
         #expect(entry.outputTokens == 50)
         #expect(entry.cachedInputTokens == 30)
         #expect(entry.reasoningOutputTokens == 0)
@@ -129,19 +135,30 @@ struct VibeSyncClaudeCodeParserTests {
         #expect(result.entries.map(\.model) == ["claude-sonnet-4-5", "claude-sonnet-4-5"])
     }
 
-    @Test("cache creation counts max(total, 5m + 1h breakdown)")
+    // Upstream e9ae391: cache creation splits by TTL; the unexplained
+    // remainder of cache_creation_input_tokens (breakdown missing or short)
+    // lands on the cheaper 5m bucket, never on 1h. The split total still
+    // equals the old max(direct, breakdown) exactly.
+    @Test("cache creation splits by TTL, unexplained remainder booked to 5m")
     func cacheCreationBreakdown() throws {
         let root = try makeRoot()
         try writeJsonl(root: root, subdir: "projects", path: "-Users-x-alpha/sid", lines: [
+            // Breakdown (40 + 30 = 70) exceeds the stated total (10): split wins as-is.
             assistantLine("2026-09-01T10:00:01.000Z", id: "msg_1",
                           input: 100, cacheCreation: 10,
                           cacheCreationBreakdown: (fiveMin: 40, oneHour: 30)),
+            // Breakdown short of the total: 70 explained, 20 unexplained → 5m.
             assistantLine("2026-09-01T10:00:02.000Z", id: "msg_2",
                           input: 100, cacheCreation: 90,
                           cacheCreationBreakdown: (fiveMin: 40, oneHour: 30)),
+            // No breakdown at all: the whole total is unexplained → 5m.
+            assistantLine("2026-09-01T10:00:03.000Z", id: "msg_3",
+                          input: 3, output: 1, cacheCreation: 400),
         ])
         let result = try VibeClaudeCodeParser(roots: [root.path]).parse()
-        #expect(result.entries.map(\.inputTokens) == [170, 190])
+        #expect(result.entries.map(\.inputTokens) == [100, 100, 3])
+        #expect(result.entries.map(\.cacheCreation5mTokens) == [40, 60, 400])
+        #expect(result.entries.map(\.cacheCreation1hTokens) == [30, 30, 0])
     }
 
     @Test("the most complete copy wins when a session exists under several roots")
@@ -260,5 +277,103 @@ struct VibeSyncClaudeCodeParserTests {
         let first = try parser.parse()
         let second = try parser.parse()
         #expect(first == second)
+    }
+
+    // Upstream e9ae391: fast mode (usage.speed == "fast") is a priced service
+    // tier; the parser tags the model with a `-fast` marker and the server's
+    // pricing map resolves it, falling back to the base rate when no priority
+    // tier is published.
+    @Test("fast-mode records get a -fast model marker, standard records do not")
+    func fastModeSpeedMarker() throws {
+        let root = try makeRoot()
+        try writeJsonl(root: root, subdir: "projects", path: "-Users-x-alpha/sid", lines: [
+            assistantLine("2026-09-01T10:00:01.000Z", id: "msg_1", model: "claude-opus-5",
+                          input: 10, output: 2, speed: "standard"),
+            assistantLine("2026-09-01T10:00:02.000Z", id: "msg_2", model: "claude-opus-5",
+                          input: 10, output: 2, speed: "fast"),
+            // Already-suffixed models are not double-tagged; casing/whitespace
+            // around "fast" is tolerated.
+            assistantLine("2026-09-01T10:00:03.000Z", id: "msg_3", model: "claude-opus-5-fast",
+                          input: 1, output: 1, speed: " Fast "),
+            // message.speed is accepted too (a build that moves the field).
+            """
+            {"type":"assistant","timestamp":"2026-09-01T10:00:04.000Z","cwd":"/Users/x/alpha","sessionId":"sid","uuid":"u4","message":{"id":"msg_4","model":"claude-opus-5","speed":"fast","usage":{"input_tokens":5,"output_tokens":1}}}
+            """,
+        ])
+        let result = try VibeClaudeCodeParser(roots: [root.path]).parse()
+        #expect(result.entries.count == 4)
+        let byId = Dictionary(grouping: result.entries, by: \.timestamp)
+        #expect(byId[date("2026-09-01T10:00:01.000Z")]?.first?.model == "claude-opus-5")
+        #expect(byId[date("2026-09-01T10:00:02.000Z")]?.first?.model == "claude-opus-5-fast")
+        #expect(byId[date("2026-09-01T10:00:03.000Z")]?.first?.model == "claude-opus-5-fast")
+        #expect(byId[date("2026-09-01T10:00:04.000Z")]?.first?.model == "claude-opus-5-fast")
+        // Token mapping itself is unaffected by the marker.
+        #expect(byId[date("2026-09-01T10:00:02.000Z")]?.first?.inputTokens == 10)
+    }
+
+    // Upstream 22cef3d: explicit extra roots are additive, and a session
+    // copied between the primary and an extra root is scanned once.
+    @Test("explicit extra roots are additive and copied sessions stay deduplicated")
+    func extraRootsAdditive() throws {
+        let container = try makeRoot()
+        let primary = container.appendingPathComponent("primary")
+        let extra = container.appendingPathComponent("extra")
+        let copied = [
+            userLine("2026-09-01T10:00:00.000Z"),
+            assistantLine("2026-09-01T10:00:01.000Z", id: "call", requestId: "request", input: 10, output: 2),
+        ]
+        try writeJsonl(root: primary, subdir: "projects", path: "-Users-x-alpha/one", lines: copied)
+        try writeJsonl(root: extra, subdir: "projects", path: "-Users-x-alpha/one", lines: copied)
+        try writeJsonl(root: extra, subdir: "projects", path: "-Users-x-alpha/two", lines: [
+            userLine("2026-09-01T10:01:00.000Z"),
+            assistantLine("2026-09-01T10:01:01.000Z", id: "call2", requestId: "request2", input: 5, output: 1),
+        ])
+
+        // The primary root passed again as an extra root collapses in dedupe.
+        let result = try VibeClaudeCodeParser(roots: [primary.path], extraRoots: [extra.path, primary.path]).parse()
+        #expect(!result.skipped)
+        #expect(result.entries.map(\.inputTokens).sorted() == [5, 10])  // 15 total, not 25
+        #expect(Set(result.events.map(\.sessionId)) == ["one", "two"])
+    }
+
+    // Upstream 22cef3d: an extra root without a readable projects/ or
+    // transcripts/ directory is invalid; the JS warning collapses into
+    // `skipped: true` here so incremental state is never pruned on it.
+    @Test("an invalid extra root flags the result skipped without dropping valid data")
+    func invalidExtraRootSkips() throws {
+        let primary = try makeRoot()
+        try writeJsonl(root: primary, subdir: "projects", path: "-Users-x-alpha/sid", lines: [
+            assistantLine("2026-09-01T10:00:01.000Z", id: "msg_1"),
+        ])
+
+        let missing = try VibeClaudeCodeParser(
+            roots: [primary.path], extraRoots: [primary.appendingPathComponent("missing").path]).parse()
+        #expect(missing.skipped)
+        #expect(missing.entries.count == 1)
+
+        // An existing directory without projects/ or transcripts/ is invalid too.
+        let empty = try makeRoot()
+        let noStore = try VibeClaudeCodeParser(roots: [primary.path], extraRoots: [empty.path]).parse()
+        #expect(noStore.skipped)
+        #expect(noStore.entries.count == 1)
+    }
+
+    // Upstream 5387113: a root that exists but is not a directory must not
+    // pass as a successful empty scan (that would let incremental state be
+    // pruned); a missing root stays a silent empty scan.
+    @Test("a root that is a regular file flags skipped instead of an empty success")
+    func fileRootIsInvalid() throws {
+        let root = try makeRoot()
+        let file = root.appendingPathComponent("not-a-directory")
+        try "x".write(to: file, atomically: true, encoding: .utf8)
+
+        let invalid = try VibeClaudeCodeParser(roots: [file.path]).parse()
+        #expect(invalid.skipped)
+        #expect(invalid.entries.isEmpty)
+        #expect(invalid.events.isEmpty)
+
+        let missing = try VibeClaudeCodeParser(roots: [root.appendingPathComponent("missing").path]).parse()
+        #expect(!missing.skipped)
+        #expect(missing.entries.isEmpty)
     }
 }

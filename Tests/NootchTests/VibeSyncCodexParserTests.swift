@@ -337,3 +337,250 @@ private func utc(_ string: String) -> Date {
     #expect(result.entries.count == 2)
     #expect(result.entries.map(\.inputTokens).sorted() == [10, 15])
 }
+
+// MARK: - Continuation segments (upstream 84d007b, issue #94)
+//
+// Codex can split one session into disjoint continuation rollouts sharing a
+// session id. The Swift fixture helpers differ from upstream's: tokenCount
+// takes total:/last: dictionaries and usageDict is (input, output, cached,
+// reasoning).
+
+/// Upstream tokenCount(ts, usage, total): last_token_usage + a cumulative
+/// total carrying only total_tokens.
+private func segmentToken(_ timestamp: String, input: Double, total: Double) -> [String: Any] {
+    tokenCount(timestamp, total: ["total_tokens": total],
+               last: usageDict(input: input, output: 0, cached: 0, reasoning: 0))
+}
+
+@Test func codexContinuationSegmentsAreMergedAcrossFiles() throws {
+    let root = try makeTempDirectory()
+    let t = "2026-09-06T00:00:00.000Z"
+    let header = [
+        jsonLine(sessionMeta(id: "segments", timestamp: t)),
+        jsonLine(turnContext(t, model: "test-model")),
+    ]
+    // The active continuation (b) is shorter than the older segment (a); the
+    // old "most complete copy wins" rule dropped its usage entirely.
+    try writeRollout(header + [
+        jsonLine(segmentToken("2026-09-06T00:01:00.000Z", input: 10, total: 10)),
+        jsonLine(segmentToken("2026-09-06T00:02:00.000Z", input: 10, total: 20)),
+    ], to: root.appendingPathComponent("sessions/rollout-a.jsonl"))
+    try writeRollout(header + [
+        jsonLine(segmentToken("2026-09-06T00:03:00.000Z", input: 10, total: 30)),
+    ], to: root.appendingPathComponent("sessions/rollout-b.jsonl"))
+
+    let result = try VibeSyncCodexParser(codexHome: root.path).parse()
+    #expect(!result.skipped)
+    #expect(result.entries.map(\.inputTokens).reduce(0, +) == 30)
+    // One logical session across both physical files.
+    #expect(Set(result.events.map(\.sessionId)) == ["segments"])
+}
+
+@Test func codexOverlappingSegmentsPreserveCumulativeBaselinesAndResets() throws {
+    let root = try makeTempDirectory()
+    let t = "2026-09-06T00:00:00.000Z"
+    let header = [
+        jsonLine(sessionMeta(id: "segments", timestamp: t)),
+        jsonLine(turnContext(t, model: "test-model")),
+    ]
+    // Cumulative-only records (no last_token_usage): the merged baseline chain
+    // must survive the overlap, the archived copy, and the counter reset.
+    func total(_ minute: Int, _ input: Double) -> String {
+        jsonLine(tokenCount("2026-09-06T00:0\(minute):00.000Z",
+                            total: usageDict(input: input, output: 0, cached: 0, reasoning: 0)))
+    }
+    let a = total(1, 10), b = total(2, 20), c = total(3, 30), reset = total(4, 5), next = total(5, 8)
+    try writeRollout(header + [a, b], to: root.appendingPathComponent("sessions/rollout-a.jsonl"))
+    try writeRollout(header + [b, c, reset, next], to: root.appendingPathComponent("sessions/rollout-b.jsonl"))
+    try writeRollout(header + [a, b], to: root.appendingPathComponent("archived_sessions/rollout-copy.jsonl"))
+
+    let result = try VibeSyncCodexParser(codexHome: root.path).parse()
+    #expect(!result.skipped)
+    // 10 (first total as-is) + 10 (delta) + 10 (delta) + 5 (reset baseline) + 3 (delta).
+    #expect(result.entries.map(\.inputTokens).reduce(0, +) == 38)
+    #expect(Set(result.events.map(\.sessionId)) == ["segments"])
+}
+
+@Test func codexSegmentModelAndTierContextsSurviveFileNameReversal() throws {
+    let t = "2026-09-06T00:00:00.000Z"
+    // One segment carries model-a/priority, the other model-b/flex; each
+    // token_count keeps the context in effect where it was written, whichever
+    // member file sorts first.
+    func parse(_ root: URL, _ files: [(name: String, model: String, tier: String, minute: Int, total: Double)]) throws -> VibeParseResult {
+        for file in files {
+            try writeRollout([
+                jsonLine(sessionMeta(id: "segments", timestamp: t)),
+                jsonLine(turnContext(t, model: file.model, serviceTier: file.tier)),
+                jsonLine(tokenCount("2026-09-06T00:0\(file.minute):00.000Z",
+                                    total: usageDict(input: file.total, output: 0, cached: 0, reasoning: 0),
+                                    last: usageDict(input: 10, output: 0, cached: 0, reasoning: 0))),
+            ], to: root.appendingPathComponent("sessions/rollout-\(file.name).jsonl"))
+        }
+        return try VibeSyncCodexParser(codexHome: root.path).parse()
+    }
+    let first = try parse(try makeTempDirectory(),
+                          [(name: "a", model: "model-a", tier: "priority", minute: 1, total: 10),
+                           (name: "b", model: "model-b", tier: "flex", minute: 2, total: 20)])
+    let reversed = try parse(try makeTempDirectory(),
+                             [(name: "b", model: "model-a", tier: "priority", minute: 1, total: 10),
+                              (name: "a", model: "model-b", tier: "flex", minute: 2, total: 20)])
+    #expect(first.entries == reversed.entries)
+    #expect(first.events == reversed.events)
+    #expect(first.entries.first { $0.model == "model-a-priority" }?.inputTokens == 10)
+    #expect(first.entries.first { $0.model == "model-b-flex" }?.inputTokens == 10)
+}
+
+@Test func codexCrossFileDedupRetainsSingleFileRepetitions() throws {
+    let root = try makeTempDirectory()
+    let t = "2026-09-06T00:00:00.000Z"
+    let meta = jsonLine(sessionMeta(id: "segments", timestamp: t))
+    let repeated = jsonLine(segmentToken(t, input: 10, total: 0))
+    let later = jsonLine(segmentToken("2026-09-06T00:01:00.000Z", input: 10, total: 0))
+    // Occurrence N in one file matches occurrence N in the other: the two
+    // in-file repetitions both survive, the cross-file copy collapses.
+    try writeRollout([meta, repeated, repeated], to: root.appendingPathComponent("sessions/rollout-a.jsonl"))
+    try writeRollout([meta, repeated, later], to: root.appendingPathComponent("sessions/rollout-b.jsonl"))
+
+    let result = try VibeSyncCodexParser(codexHome: root.path).parse()
+    #expect(!result.skipped)
+    #expect(result.entries.map(\.inputTokens).reduce(0, +) == 30)
+}
+
+@Test func codexForkReplayMatchesParentSpreadOverContinuationFiles() throws {
+    let root = try makeTempDirectory()
+    let t = "2026-09-06T00:00:00.000Z"
+    let a = segmentToken("2026-09-06T00:01:00.000Z", input: 10, total: 10)
+    let b = segmentToken("2026-09-06T00:02:00.000Z", input: 10, total: 20)
+    let childTime = "2026-09-06T00:03:00.000Z"
+    var copiedA = a, copiedB = b
+    copiedA["timestamp"] = childTime
+    copiedB["timestamp"] = childTime
+    let child = [
+        jsonLine(sessionMeta(id: "child", timestamp: childTime, forkedFrom: "parent")),
+        jsonLine(copiedA), jsonLine(copiedB),
+        jsonLine(segmentToken("2026-09-06T00:04:00.000Z", input: 5, total: 25)),
+    ]
+    try writeRollout([jsonLine(sessionMeta(id: "parent", timestamp: t)), jsonLine(a)],
+                     to: root.appendingPathComponent("sessions/rollout-a.jsonl"))
+    try writeRollout([jsonLine(sessionMeta(id: "parent", timestamp: t)), jsonLine(b)],
+                     to: root.appendingPathComponent("sessions/rollout-b.jsonl"))
+    try writeRollout(child, to: root.appendingPathComponent("sessions/rollout-child.jsonl"))
+    try writeRollout(child, to: root.appendingPathComponent("archived_sessions/rollout-child-copy.jsonl"))
+
+    let result = try VibeSyncCodexParser(codexHome: root.path).parse()
+    #expect(!result.skipped)
+    // Parent 10 + 10; the fork contributes only its own 5 — the replay prefix
+    // matches against the parent's MERGED fingerprint sequence.
+    #expect(result.entries.map(\.inputTokens).reduce(0, +) == 25)
+    #expect(Set(result.events.map(\.sessionId)) == ["parent", "child"])
+}
+
+@Test func codexSegmentedSessionMatchesUnsplitTranscript() throws {
+    let t = "2026-09-06T00:00:00.000Z"
+    let meta = jsonLine(sessionMeta(id: "segments", timestamp: t, cwd: "/x/demo"))
+    let a = jsonLine(tokenCount("2026-09-06T00:01:00.000Z", total: ["total_tokens": 14],
+                                last: usageDict(input: 10, output: 4, cached: 3, reasoning: 1)))
+    // Chat text is dropped from merged records; only type/timestamp survive,
+    // which is all the timing pass reads.
+    let chat = jsonLine([
+        "timestamp": "2026-09-06T00:02:00.000Z",
+        "type": "response_item",
+        "payload": ["role": "assistant", "content": [["text": "PRIVATE_SEGMENT_CHAT_SENTINEL"]]],
+    ] as [String: Any])
+    let b = jsonLine(tokenCount("2026-09-06T00:03:00.000Z", total: ["total_tokens": 42],
+                                last: usageDict(input: 20, output: 8, cached: 6, reasoning: 2)))
+
+    let wholeRoot = try makeTempDirectory()
+    try writeRollout([meta, a, chat, b], to: wholeRoot.appendingPathComponent("sessions/rollout-whole.jsonl"))
+    let expected = try VibeSyncCodexParser(codexHome: wholeRoot.path).parse()
+
+    let splitRoot = try makeTempDirectory()
+    try writeRollout([meta, a, chat], to: splitRoot.appendingPathComponent("sessions/rollout-a.jsonl"))
+    try writeRollout([meta, chat, b], to: splitRoot.appendingPathComponent("sessions/rollout-b.jsonl"))
+    let result = try VibeSyncCodexParser(codexHome: splitRoot.path).parse()
+
+    #expect(!result.skipped)
+    #expect(result.entries == expected.entries)
+    #expect(result.events == expected.events)
+}
+
+@Test func codexConflictingSegmentOrderSkipsSource() throws {
+    let root = try makeTempDirectory()
+    let t = "2026-09-06T00:00:00.000Z"
+    let meta = jsonLine(sessionMeta(id: "segments", timestamp: t))
+    // Same timestamps, distinct payloads, contradictory order across the two
+    // copies: skip the source instead of inventing a possibly
+    // double-counting sequence.
+    let a = jsonLine(segmentToken(t, input: 10, total: 10))
+    let b = jsonLine(segmentToken(t, input: 10, total: 20))
+    try writeRollout([meta, a, b], to: root.appendingPathComponent("sessions/rollout-a.jsonl"))
+    try writeRollout([meta, b, a], to: root.appendingPathComponent("sessions/rollout-b.jsonl"))
+
+    let result = try VibeSyncCodexParser(codexHome: root.path).parse()
+    #expect(result.skipped)
+    #expect(result.entries.isEmpty)
+    #expect(result.events.isEmpty)
+}
+
+@Test func codexSegmentCacheFollowsAppendsAndMemberRemoval() throws {
+    let root = try makeTempDirectory()
+    let parser = VibeSyncCodexParser(codexHome: root.path)
+    let t = "2026-09-06T00:00:00.000Z"
+    let meta = jsonLine(sessionMeta(id: "segments", timestamp: t))
+    let fileA = root.appendingPathComponent("sessions/rollout-a.jsonl")
+    let fileB = root.appendingPathComponent("sessions/rollout-b.jsonl")
+    try writeRollout([meta, jsonLine(segmentToken(t, input: 10, total: 10))], to: fileA)
+    try writeRollout([meta, jsonLine(segmentToken("2026-09-06T00:01:00.000Z", input: 10, total: 20))], to: fileB)
+
+    func inputSum() throws -> Double {
+        try parser.parse().entries.map(\.inputTokens).reduce(0, +)
+    }
+    func append(_ line: String, to url: URL) throws {
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data((line + "\n").utf8))
+        try handle.close()
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(60)], ofItemAtPath: url.path)
+    }
+
+    #expect(try inputSum() == 20)
+    // A re-parse over unchanged files comes entirely from the cache.
+    #expect(try parser.parse() == parser.parse())
+
+    try append(jsonLine(segmentToken("2026-09-06T00:02:00.000Z", input: 10, total: 30)), to: fileB)
+    #expect(try inputSum() == 30)
+    try append(jsonLine(segmentToken("2026-09-06T00:03:00.000Z", input: 10, total: 40)), to: fileA)
+    #expect(try inputSum() == 40)
+
+    // Removing one member leaves the other as a standalone session.
+    try FileManager.default.removeItem(at: fileB)
+    #expect(try inputSum() == 20)
+}
+
+@Test func codexUnreadableContinuationSuppressesPartialResults() throws {
+    // POSIX chmod fixture; root bypasses the denial.
+    guard getuid() != 0 else { return }
+    let root = try makeTempDirectory()
+    let parser = VibeSyncCodexParser(codexHome: root.path)
+    let t = "2026-09-06T00:00:00.000Z"
+    let meta = jsonLine(sessionMeta(id: "segments", timestamp: t))
+    let fileA = root.appendingPathComponent("sessions/rollout-a.jsonl")
+    let fileB = root.appendingPathComponent("sessions/rollout-b.jsonl")
+    try writeRollout([meta, jsonLine(segmentToken(t, input: 10, total: 10))], to: fileA)
+    try writeRollout([meta, jsonLine(segmentToken("2026-09-06T00:01:00.000Z", input: 10, total: 20))], to: fileB)
+
+    // An unreadable member may hide part of the session: the readable
+    // remainder must never upload as the complete total (upstream 84d007b —
+    // its test disables the disk cache to force the re-read; here the denial
+    // applies from the first, cold parse instead).
+    try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: fileB.path)
+    let failed = try parser.parse()
+    #expect(failed.skipped)
+    #expect(failed.entries.isEmpty)
+    #expect(failed.events.isEmpty)
+
+    // The denial is transient: once readable again, the session parses whole.
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileB.path)
+    #expect(try parser.parse().entries.map(\.inputTokens).reduce(0, +) == 20)
+}

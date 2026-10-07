@@ -1,0 +1,12 @@
+[
+  {
+    "ts": 1767225600000,
+    "type": "ask"
+  },
+  {
+    "ts": 1767225605000,
+    "type": "say",
+    "say": "api_req_started",
+    "text": "{\"model\":\"claude\",\"tokensIn\":10,\"tokensOut\":20,\"cacheWrites\":3,\"cacheReads\":5}"
+  }
+]

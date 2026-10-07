@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import Synchronization
 
 /// Grok (Grok Build TUI / CLI) log parser — Swift port of vibe-usage
@@ -9,6 +10,10 @@ import Synchronization
 ///     summary.json  — cwd, model, timestamps
 ///     updates.jsonl — ACP session updates; turn_completed carries exact usage
 ///     events.jsonl  — turn_started / turn_ended timing fallback
+///     usage.json    — 1.0+ per-turn token ledger (`grok usage` is its
+///                     documented reader); consulted only when the ACP stream
+///                     yielded no usage, so both copies never count twice
+///     signals.json  — turnCount / modelsUsed canary for format moves
 ///
 /// Root discovery: VIBE_USAGE_GROK_SESSIONS override (tests / relocated
 /// trees), else $GROK_HOME/sessions, else ~/.grok/sessions.
@@ -18,17 +23,27 @@ import Synchronization
 /// output is output − reasoning, matching Codex/Copilot so totalTokens does
 /// not double-count cache/reasoning. All-zero turns emit nothing. Per-model
 /// `modelUsage` (when present and non-empty) wins over the turn-level totals.
+/// Ledger records carry no timestamps or model id: turns pair with the
+/// session's turn_completed events by order and fall back to the summary's
+/// model, and ledger cacheCreationTokens fold into input (Grok publishes no
+/// separate cache-write rate, and pre-1.0 those tokens were part of
+/// inputTokens).
 ///
 /// Documented simplifications vs the JS original:
 /// - No extraRoots / strict-mode support: the JS parser warns-and-skips when a
 ///   user-configured extra root is unreadable; the Swift protocol has no
 ///   warnings channel and the app configures no extra roots, so a missing
 ///   default root simply yields an empty result (same as JS).
+/// - The JS `warnings` array has no VibeParseResult equivalent; the
+///   signals.json format canary logs through OSLog (like VibeSyncEngine)
+///   instead of surfacing a warning string.
 /// - Timestamp strings are parsed as ISO8601 only; JS `new Date(value)`
 ///   accepts a few more formats, none of which Grok writes.
 struct VibeGrokParser: VibeLogParser {
     let source = "grok"
     private let sessionRoots: [String]
+
+    private static let logger = Logger(subsystem: "nootch", category: "VibeSync")
 
     init(sessionRoots: [String]? = nil, environment: [String: String] = ProcessInfo.processInfo.environment) {
         if let sessionRoots {
@@ -177,6 +192,10 @@ struct VibeGrokParser: VibeLogParser {
         let updates: FileStamp?
         let events: FileStamp?
         let summary: FileStamp?
+        // usage.json carries usage for 1.0+ sessions; without its stamp a
+        // ledger landing after the first scan would never be picked up.
+        // (signals.json only feeds the log canary, not the parsed output.)
+        let usage: FileStamp?
     }
 
     private struct CacheEntry: Sendable {
@@ -201,7 +220,8 @@ struct VibeGrokParser: VibeLogParser {
         SessionFingerprint(
             updates: stamp(sessionPath + "/updates.jsonl"),
             events: stamp(sessionPath + "/events.jsonl"),
-            summary: stamp(sessionPath + "/summary.json"))
+            summary: stamp(sessionPath + "/summary.json"),
+            usage: stamp(sessionPath + "/usage.json"))
     }
 
     private func cachedSession(_ session: SessionCandidate) -> ParsedSession {
@@ -233,7 +253,11 @@ struct VibeGrokParser: VibeLogParser {
         let fallbackModel = (summary["current_model_id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "unknown"
 
         // Prefer updates.jsonl turn_completed for exact usage + message timings.
+        // `turnTimestamps` keeps their order so a 1.x usage.json ledger (which
+        // has no timestamps of its own) can be paired turn-by-turn below.
         var sawUserOrAssistant = false
+        var usageFromUpdates = 0
+        var turnTimestamps: [Date] = []
         Self.forEachJSONLine(at: session.path + "/updates.jsonl") { object in
             guard let params = object["params"] as? [String: Any],
                   let update = params["update"] as? [String: Any]
@@ -242,8 +266,11 @@ struct VibeGrokParser: VibeLogParser {
             let timestamp = Self.toDate(object["timestamp"])
 
             if kind == "turn_completed", let timestamp {
+                turnTimestamps.append(timestamp)
+                let before = parsed.entries.count
                 Self.emitTurnUsage(into: &parsed.entries, usage: update["usage"] as? [String: Any],
                                    project: project, timestamp: timestamp, fallbackModel: fallbackModel)
+                if parsed.entries.count > before { usageFromUpdates += 1 }
             }
             guard let timestamp else { return }
 
@@ -260,6 +287,42 @@ struct VibeGrokParser: VibeLogParser {
                     timestamp: timestamp, role: .assistant))
             default:
                 break
+            }
+        }
+
+        // 1.x sessions keep per-turn totals in usage.json instead of the ACP
+        // stream. Consulted only when updates.jsonl yielded no usage, so a
+        // session that carries both is never counted twice.
+        if usageFromUpdates == 0 {
+            let records = Self.usageLedgerRecords(at: session.path)
+            if !records.isEmpty {
+                let sessionTimestamp = Self.toDate(
+                    summary["updated_at"] ?? summary["last_active_at"] ?? summary["created_at"])
+                for (index, record) in records.enumerated() {
+                    guard let usage = Self.ledgerRecordUsage(record) else { continue }
+                    let timestamp = index < turnTimestamps.count ? turnTimestamps[index] : sessionTimestamp
+                    guard let timestamp else { continue }
+                    Self.emitTurnUsage(into: &parsed.entries, usage: usage,
+                                       project: project, timestamp: timestamp, fallbackModel: fallbackModel)
+                }
+            }
+        }
+
+        // Canary for the next on-disk format move: a session whose signals.json
+        // reports completed turns (and a model) but whose usage we could not
+        // read from either source is a silent collection gap, not an idle
+        // session — 1.0 moved the ledger to usage.json exactly like this. The
+        // JS parser returns a `warnings` entry; the Swift protocol has no
+        // warnings channel, so this logs instead (and only on a fresh scan,
+        // since the cached session is not re-scanned while files are unchanged).
+        if parsed.entries.isEmpty {
+            let signals = Self.readJSON(session.path + "/signals.json")
+            let turnCount = Self.number(signals?["turnCount"])
+            let modelsUsed = (signals?["modelsUsed"] as? [Any])?
+                .compactMap { $0 as? String }.filter { !$0.isEmpty } ?? []
+            if turnCount > 0, !modelsUsed.isEmpty {
+                Self.logger.warning(
+                    "grok: session \(session.sessionId, privacy: .public) reports \(Int(turnCount), privacy: .public) completed turn(s) but no usage could be read — Grok may have changed its on-disk usage format; this session's usage was not uploaded")
             }
         }
 
@@ -303,6 +366,48 @@ struct VibeGrokParser: VibeLogParser {
     }
 
     // MARK: - Usage mapping
+
+    /// Grok 1.0 moved per-turn token accounting out of the ACP stream into a
+    /// dedicated `<session>/usage.json` ledger — `grok usage <session-id>` is
+    /// its documented reader, and the sessions guide says to use it "instead
+    /// of reading session files". Older builds (0.2.x) wrote the same numbers
+    /// into updates.jsonl turn_completed.usage; those sessions have no
+    /// usage.json. Returns the ledger's turn records, or the session totals as
+    /// a single record when turns are absent (JS readUsageLedger).
+    private static func usageLedgerRecords(at sessionPath: String) -> [Any] {
+        guard let ledger = readJSON(sessionPath + "/usage.json") else { return [] }
+        let turns = ledger["turns"] as? [Any] ?? []
+        if !turns.isEmpty { return turns }
+        if let session = ledger["session"] as? [String: Any] { return [session] }
+        return []
+    }
+
+    /// Map one ledger record (turn or session totals) onto the usage shape the
+    /// ACP stream uses (JS ledgerRecordUsage). Cache writes fold into input —
+    /// Grok publishes no separate cache-write rate and pre-1.0 those tokens
+    /// were part of inputTokens, so folding keeps cross-version totals
+    /// identical. Any per-model modelUsage map folds the same way so the
+    /// caller's model attribution works exactly like the ACP path. Records
+    /// whose tokens sum to zero emit nothing.
+    private static func ledgerRecordUsage(_ record: Any?) -> [String: Any]? {
+        guard let record = record as? [String: Any] else { return nil }
+        func fold(_ entry: [String: Any]) -> [String: Any] {
+            var folded = entry
+            folded["inputTokens"] = max(0, number(entry["inputTokens"]))
+                + max(0, number(entry["cacheCreationTokens"]))
+            return folded
+        }
+        var usage = fold(record)
+        if let modelUsage = record["modelUsage"] as? [String: Any] {
+            usage["modelUsage"] = modelUsage.mapValues { entry -> Any in
+                guard let entry = entry as? [String: Any] else { return entry }
+                return fold(entry)
+            }
+        }
+        let total = number(usage["inputTokens"]) + number(usage["cachedReadTokens"])
+            + number(usage["outputTokens"]) + number(usage["reasoningTokens"])
+        return total > 0 ? usage : nil
+    }
 
     private static func emitTurnUsage(
         into entries: inout [VibeTokenEntry],

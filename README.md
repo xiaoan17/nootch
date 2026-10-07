@@ -19,13 +19,13 @@
 |---|---|---|
 | 数据源 | 11 个 AI provider 的订阅配额窗口 | 只保留 **Vibe Usage** 一个数据源 |
 | 展示内容 | 各家配额剩余百分比 | **可选窗口用量**（今日 / 24h / 近 7 天 / 近 30 天）：费用 / tokens / sessions / 活跃时长 / Top 模型 |
-| 凭证读取 | 读 macOS 钥匙串（会弹密码授权框） | 只读 `~/.vibe-usage/config.json`，**零钥匙串访问、零弹窗** |
-| 网络请求 | 轮询各家配额 API | 每 30s 读一次云端用量 + 每 30min 上传一次本地解析结果 |
+| 凭证读取 | 读 macOS 钥匙串（会弹密码授权框） | Vibe Usage 读取 `~/.vibe-usage/config.json`；Cursor 用量导出读取 Cursor 自身登录状态，**不访问钥匙串** |
+| 网络请求 | 轮询各家配额 API | 每 30s 读云端用量；每 30min 采集并同步，Cursor 从官方云端导出 |
 
 ## 工作原理
 
 ```
-你的 AI 工具日志 (Claude Code / Codex / Kimi Code / Grok / Pi)
+34 个 AI 工具来源的日志 / 用量账本（Cursor 使用官方云端导出）
         │  nootch 内置同步引擎本地解析（不上传消息内容，只报 token 计数）
         ▼
    vibecafe.ai 云端聚合
@@ -36,7 +36,9 @@
 
 **v1.2.0 起，nootch 内置了完整的同步引擎**（vibe-usage 官方协议的 Swift 原生实现）：启动后自动解析本地日志并每 30 分钟上传到 vibecafe.ai，**不需要安装 Node.js，不需要跑任何额外的 App 或后台服务**。只装这一个 App 就是完整闭环。
 
-- 支持解析：Claude Code、Codex、Kimi Code、Grok、Pi（Oh My Pi）
+- 支持 34 个来源：Claude Code、Codex、Kimi Code、Grok、Pi、CodeBuddy、CodeArts Agent、Devin、MiniMax Code、OpenCode、Alma、Amp、Antigravity、Cline、Roo Code、Cola、Copilot CLI、Craft Agent、Cursor、Dimagent、Droid、dsh、Gemini CLI、Hermes、Kiro、Mimocode、OMP（Oh My Pi）、OpenClaw、Qoder、Qoder CN、Qwen Code、Trae CLI、WorkBuddy、Zcode。
+- Cursor 只向 `cursor.com` 发送其本地登录凭证，使用 `cursor-cloud` 固定设备标识避免跨机器重复；Antigravity 旧 `.pb` 历史需要对应应用正在运行。Kiro CLI token 为上游算法估算，IDE credit 增量使用单独的 `kiro-credits` 模型。
+- 来源范围、上游版本、验证与限制见 [同步引擎验收记录](docs/sync-engine-1.4.0.md)。
 - 与官方 `vibe-usage` CLI 共用 `~/.vibe-usage/state.json` 增量状态格式，无缝接管已有数据，不会重复计数（服务端按 bucket 幂等 upsert）
 - 上传前会读取你在 vibecafe.ai 的隐私设置（是否上传项目名），消息内容永不离开本机
 - 设置里可关闭「Vibe Usage 自动同步」（只读展示，不上传）
@@ -102,6 +104,7 @@ v1.2.0 起无需任何额外组件——nootch 运行期间每 30 分钟自动�
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.4.0（本地构建，尚未发布） | 34 个采集来源；上传身份绑定、soft-drop 重试、Claude 缓存 TTL / Fast mode、Grok 用量账本；独立 zstd 运行库与解析器对照测试 |
 | 未发布 | 同步原项目上游修复：资源包查找不再依赖 `Bundle.module`（缺资源时降级而不是崩溃）；打包脚本强制校验资源包、去掉 `--deep`、支持 `CODESIGN_IDENTITY` 正式签名并在签名后校验 |
 | v1.3.4 | 统一 App 图标加载；图标文件名带内容哈希，升级后 Dock 不再显示旧图标 |
 | v1.3.3 | 去掉详情卡阴影 |
@@ -112,7 +115,7 @@ v1.2.0 起无需任何额外组件——nootch 运行期间每 30 分钟自动�
 
 ## 从源码构建
 
-需要 Xcode Command Line Tools 和 Swift 6：
+需要 Xcode Command Line Tools、Swift 6 和用于打包的 libzstd（Apple Silicon 默认 `/opt/homebrew/lib/libzstd.1.dylib`，可通过 `ZSTD_LIBRARY_PATH` 指定）。打包后运行不依赖 Homebrew 或 Node：
 
 ```sh
 git clone https://github.com/xiaoan17/nootch.git
@@ -145,4 +148,4 @@ CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" packaging/build
 
 ## English
 
-A derivative fork of [nootch](https://github.com/DeepanshuMishraa/nootch) (all UI credit goes to the original author) that drops every provider integration except one: it shows **today's AI coding usage** from [vibecafe.ai](https://vibecafe.ai) — cost, tokens, sessions, active time, and top models — in the same lovely always-on-top screen-edge overlay. Since v1.2.0 it also embeds a Swift-native reimplementation of the [vibe-usage](https://github.com/vibe-cafe/vibe-usage) sync protocol, parsing local Claude Code / Codex / Kimi Code / Grok / Pi logs and uploading token counters every 30 minutes — no Node.js, no separate daemon, one app is the whole loop. It never touches the macOS Keychain (no password prompts) and never uploads message content. Run `npx @vibe-cafe/vibe-usage` once to obtain an API key, then install the DMG from Releases. A short promo video lives at [`docs/media/nootch-promo.mp4`](docs/media/nootch-promo.mp4).
+A derivative fork of [nootch](https://github.com/DeepanshuMishraa/nootch) (all UI credit goes to the original author) that drops every provider integration except one: it shows **today's AI coding usage** from [vibecafe.ai](https://vibecafe.ai) — cost, tokens, sessions, active time, and top models — in the same lovely always-on-top screen-edge overlay. Since v1.2.0 it also embeds a Swift-native reimplementation of the [vibe-usage](https://github.com/vibe-cafe/vibe-usage) sync protocol, collecting 34 sources (local logs/ledgers plus the official Cursor cloud export) and uploading token counters every 30 minutes — no Node.js, no separate daemon, one app is the whole loop. It never touches the macOS Keychain (no password prompts) and never uploads message content. Run `npx @vibe-cafe/vibe-usage` once to obtain an API key, then install the DMG from Releases. A short promo video lives at [`docs/media/nootch-promo.mp4`](docs/media/nootch-promo.mp4).

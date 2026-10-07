@@ -9,7 +9,8 @@ import Synchronization
 /// user's history exists only in the legacy store and parsing both cannot
 /// double-count):
 ///
-/// 1. Current (`~/.kimi-code`): sessions live at
+/// 1. Current (`~/.kimi-code` and the Kimi Work desktop home): sessions live
+///    at
 ///    `sessions/wd_<slug>_<hash>/session_<id>/agents/<agent>/wire.jsonl`. Each
 ///    line is self-describing with an integer-ms `time`. `usage.record` events
 ///    are per-step deltas (any `usageScope`: `turn` is a normal step, `session`
@@ -27,8 +28,15 @@ import Synchronization
 ///    (`work_dirs` entries are md5-hashed; `workspaces`/`projects` are keyed by
 ///    hash directly). StatusUpdates dedupe globally by `payload.message_id`.
 ///
-/// Root resolution mirrors the JS test hooks: `VIBE_USAGE_KIMI_CODE_DIR`, then
-/// `KIMI_CODE_HOME`, then `~/.kimi-code`; `VIBE_USAGE_KIMI_DIR` then `~/.kimi`.
+/// Root resolution mirrors kimi-roots.js (upstream 54b7719):
+/// `VIBE_USAGE_KIMI_CODE_DIR` (test/relocation hook) replaces discovery
+/// entirely; otherwise the CLI home ($KIMI_CODE_HOME, else ~/.kimi-code) is
+/// scanned alongside the Kimi Work desktop app's embedded runtime home
+/// (<Electron userData>/kimi-desktop/daimon-share/daimon/runtime/kimi-code/
+/// home), which uses the exact CLI layout. The desktop app never writes into
+/// the CLI home, so the stores are independent and merging cannot
+/// double-count; roots that resolve to the same directory are deduped by
+/// realpath. `VIBE_USAGE_KIMI_DIR` then `~/.kimi` for the legacy store.
 ///
 /// Documented simplifications vs. the JS implementation:
 /// - JSON booleans are not coerced to 0/1 (JS `Number(true) == 1`); a boolean
@@ -41,27 +49,97 @@ import Synchronization
 struct VibeKimiCodeParser: VibeLogParser {
     let source = "kimi-code"
 
-    private let kimiCodeRoot: URL
+    private let kimiCodeRoots: [URL]
     private let legacyKimiRoot: URL
 
     init(
         kimiCodeRoot: URL? = nil,
+        kimiCodeRoots: [URL]? = nil,
         legacyKimiRoot: URL? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment)
     {
-        self.kimiCodeRoot = kimiCodeRoot ?? Self.resolveKimiCodeRoot(environment: environment)
+        if let kimiCodeRoots {
+            self.kimiCodeRoots = kimiCodeRoots
+        } else if let kimiCodeRoot {
+            self.kimiCodeRoots = [kimiCodeRoot]
+        } else {
+            self.kimiCodeRoots = Self.resolveKimiCodeRoots(environment: environment)
+        }
         self.legacyKimiRoot = legacyKimiRoot ?? Self.resolveLegacyKimiRoot(environment: environment)
     }
 
-    static func resolveKimiCodeRoot(environment: [String: String]) -> URL {
+    /// Kimi Code data homes to scan, CLI home first (JS resolveKimiCodeRoots).
+    /// `VIBE_USAGE_KIMI_CODE_DIR` replaces discovery entirely so a fixture
+    /// never picks up the machine's real stores.
+    static func resolveKimiCodeRoots(
+        environment: [String: String],
+        platform: String = currentPlatform,
+        home: String = FileManager.default.homeDirectoryForCurrentUser.path
+    ) -> [URL] {
         if let override = environment["VIBE_USAGE_KIMI_CODE_DIR"]?.trimmingCharacters(in: .whitespaces),
            !override.isEmpty {
-            return URL(fileURLWithPath: NSString(string: override).expandingTildeInPath)
+            return [URL(fileURLWithPath: NSString(string: override).expandingTildeInPath)]
         }
-        if let home = environment["KIMI_CODE_HOME"]?.trimmingCharacters(in: .whitespaces), !home.isEmpty {
-            return URL(fileURLWithPath: NSString(string: home).expandingTildeInPath)
+        let cliHome: String
+        if let configured = environment["KIMI_CODE_HOME"]?.trimmingCharacters(in: .whitespaces),
+           !configured.isEmpty {
+            cliHome = NSString(string: configured).expandingTildeInPath
+        } else {
+            cliHome = home + "/.kimi-code"
         }
-        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kimi-code")
+        return uniquePaths([cliHome, kimiWorkCodeHome(environment: environment, platform: platform, home: home)])
+            .map { URL(fileURLWithPath: $0) }
+    }
+
+    /// Kimi Work's embedded Kimi Code home for the given platform, relative to
+    /// the app's Electron userData (JS kimiWorkCodeHome).
+    static func kimiWorkCodeHome(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        platform: String = currentPlatform,
+        home: String = FileManager.default.homeDirectoryForCurrentUser.path
+    ) -> String {
+        let separator: String
+        let userData: String
+        switch platform {
+        case "win32":
+            separator = "\\"
+            let appData = environment["APPDATA"]?.trimmingCharacters(in: .whitespaces) ?? ""
+            userData = appData.isEmpty ? home + "\\AppData\\Roaming" : appData
+        case "darwin":
+            separator = "/"
+            userData = home + "/Library/Application Support"
+        default:
+            separator = "/"
+            let xdg = environment["XDG_CONFIG_HOME"]?.trimmingCharacters(in: .whitespaces) ?? ""
+            userData = xdg.isEmpty ? home + "/.config" : xdg
+        }
+        return ([userData, "kimi-desktop", "daimon-share", "daimon", "runtime", "kimi-code", "home"])
+            .joined(separator: separator)
+    }
+
+    static var currentPlatform: String {
+        #if os(Windows)
+        "win32"
+        #elseif os(macOS)
+        "darwin"
+        #else
+        "linux"
+        #endif
+    }
+
+    /// Two roots can name the same directory (symlinks, a relocated home that
+    /// still resolves to the same store); scanning both would double-count
+    /// every record. realpathSync is approximated with
+    /// resolvingSymlinksInPath (enough to dedupe symlinked roots).
+    private static func uniquePaths(_ paths: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for path in paths {
+            let key = (path as NSString).resolvingSymlinksInPath
+            guard seen.insert(key).inserted else { continue }
+            result.append(path)
+        }
+        return result
     }
 
     static func resolveLegacyKimiRoot(environment: [String: String]) -> URL {
@@ -88,16 +166,25 @@ struct VibeKimiCodeParser: VibeLogParser {
     }
 
     private func parseCurrent(into result: inout VibeParseResult, liveKeys: inout Set<String>) {
-        let sessionsDir = kimiCodeRoot.appendingPathComponent("sessions")
-        let sessionIndex = Self.loadSessionIndex(at: kimiCodeRoot.appendingPathComponent("session_index.jsonl"))
-        for wire in Self.findCurrentWireFiles(sessionsDir: sessionsDir) {
-            liveKeys.insert(wire.file.path)
-            let project = sessionIndex[wire.sessionDirPath] ?? wire.bucketProject
-            let output = Self.cachedParse(at: wire.file) {
-                Self.parseCurrentWire(at: wire.file, sessionDir: wire.sessionDirPath, project: project)
+        // Two roots can resolve to the same store (symlink, relocated home),
+        // so the same physical wire file is parsed once (JS
+        // findKimiCodeWireFilesInAllRoots). Each home's own
+        // session_index.jsonl applies to its sessions.
+        var seen = Set<String>()
+        for root in kimiCodeRoots {
+            let sessionsDir = root.appendingPathComponent("sessions")
+            let sessionIndex = Self.loadSessionIndex(at: root.appendingPathComponent("session_index.jsonl"))
+            for wire in Self.findCurrentWireFiles(sessionsDir: sessionsDir) {
+                let identity = (wire.file.path as NSString).resolvingSymlinksInPath
+                guard seen.insert(identity).inserted else { continue }
+                liveKeys.insert(wire.file.path)
+                let project = sessionIndex[wire.sessionDirPath] ?? wire.bucketProject
+                let output = Self.cachedParse(at: wire.file) {
+                    Self.parseCurrentWire(at: wire.file, sessionDir: wire.sessionDirPath, project: project)
+                }
+                result.entries.append(contentsOf: output.entries)
+                result.events.append(contentsOf: output.events)
             }
-            result.entries.append(contentsOf: output.entries)
-            result.events.append(contentsOf: output.events)
         }
     }
 

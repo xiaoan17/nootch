@@ -241,6 +241,102 @@ struct VibeKimiCodeParserTests {
         #expect(result.entries[0].model == "kimi-for-coding")
     }
 
+    // MARK: - Kimi Work desktop roots (upstream 54b7719)
+
+    @Test func kimiWorkHomeResolvesPerPlatform() {
+        #expect(
+            VibeKimiCodeParser.kimiWorkCodeHome(environment: [:], platform: "darwin", home: "/Users/me")
+                == "/Users/me/Library/Application Support/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home")
+        #expect(
+            VibeKimiCodeParser.kimiWorkCodeHome(
+                environment: ["APPDATA": #"C:\Users\me\AppData\Roaming"#],
+                platform: "win32", home: #"C:\Users\me"#)
+                == #"C:\Users\me\AppData\Roaming\kimi-desktop\daimon-share\daimon\runtime\kimi-code\home"#)
+        #expect(
+            VibeKimiCodeParser.kimiWorkCodeHome(environment: [:], platform: "linux", home: "/home/me")
+                == "/home/me/.config/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home")
+    }
+
+    @Test func cliHomeStaysPrimaryAndDesktopHomeIsAdditiveWithoutDuplicates() throws {
+        let root = try makeTempDirectory()
+        let fakeHome = root.appendingPathComponent("home")
+        let cliHome = root.appendingPathComponent("cli-home")
+        try FileManager.default.createDirectory(at: cliHome, withIntermediateDirectories: true)
+        // Same store reachable under the desktop home path: scan it once.
+        let desktopHome = root.appendingPathComponent(
+            "home/.config/kimi-desktop/daimon-share/daimon/runtime/kimi-code")
+        try FileManager.default.createDirectory(at: desktopHome, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: desktopHome.appendingPathComponent("home"), withDestinationURL: cliHome)
+
+        let withCli = VibeKimiCodeParser.resolveKimiCodeRoots(
+            environment: ["KIMI_CODE_HOME": cliHome.path], platform: "linux", home: fakeHome.path)
+        #expect(withCli.map(\.path) == [cliHome.path])
+
+        let withoutCli = VibeKimiCodeParser.resolveKimiCodeRoots(
+            environment: [:], platform: "linux", home: fakeHome.path)
+        #expect(withoutCli.map(\.path) == [
+            fakeHome.appendingPathComponent(".kimi-code").path,
+            desktopHome.appendingPathComponent("home").path,
+        ])
+
+        // The fixture hook replaces discovery entirely.
+        let override = VibeKimiCodeParser.resolveKimiCodeRoots(
+            environment: ["VIBE_USAGE_KIMI_CODE_DIR": "/fixture/home"],
+            platform: "linux", home: fakeHome.path)
+        #expect(override.map(\.path) == ["/fixture/home"])
+    }
+
+    @Test func desktopSessionsMergeWithCliHome() throws {
+        let root = try makeTempDirectory()
+        let cliHome = root.appendingPathComponent("cli-home")
+        let desktopHome = try makeTempDirectory().appendingPathComponent(
+            "Library/Application Support/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home")
+        let emptyLegacy = try makeTempDirectory()
+        let startMs = try Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+            .parse("2026-09-08T08:01:00.000Z").timeIntervalSince1970 * 1000
+
+        func writeWire(home: URL, bucket: String, session: String, workDir: String, time: Double) throws {
+            let sessionDir = home.appendingPathComponent("sessions/\(bucket)/\(session)")
+            try write(
+                """
+                {"type":"turn.prompt","origin":{"kind":"user"},"time":\(Int(time))}
+                {"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":7,"output":3,"inputCacheRead":2,"inputCacheCreation":1},"usageScope":"turn","time":\(Int(time + 1000))}
+                """,
+                to: sessionDir.appendingPathComponent("agents/main/wire.jsonl"))
+            let indexLine = """
+                {"sessionId":"\(session)","sessionDir":"\(sessionDir.path)","workDir":"\(workDir)"}
+                """
+            let indexURL = home.appendingPathComponent("session_index.jsonl")
+            let existing = (try? String(contentsOf: indexURL, encoding: .utf8)) ?? ""
+            try write(existing + indexLine + "\n", to: indexURL)
+        }
+
+        try writeWire(
+            home: desktopHome, bucket: "wd_venture_cap_6084fcc58cb8",
+            session: "conv-desktop", workDir: "/work/venture_cap", time: startMs)
+        try writeWire(
+            home: cliHome, bucket: "wd_cli_project_abcdef",
+            session: "conv-cli", workDir: "/work/cli-project", time: startMs + 3_600_000)
+
+        let parser = VibeKimiCodeParser(
+            kimiCodeRoots: [cliHome, desktopHome], legacyKimiRoot: emptyLegacy)
+        let result = try parser.parse()
+
+        #expect(!result.skipped)
+        #expect(result.entries.count == 2)
+        #expect(result.entries.map(\.project).sorted() == ["cli-project", "venture_cap"])
+        for entry in result.entries {
+            #expect(entry.model == "kimi-code/kimi-for-coding")
+            #expect(entry.inputTokens == 8)  // inputOther + inputCacheCreation
+            #expect(entry.outputTokens == 3)
+            #expect(entry.cachedInputTokens == 2)
+        }
+        // Two logical sessions, one user turn each.
+        #expect(Set(result.events.map(\.sessionId)).count == 2)
+        #expect(result.events.filter { $0.role == .user }.count == 2)
+    }
+
     // MARK: - Cache behavior
 
     @Test func repeatedParseIsStableAndAppendIsPickedUp() throws {

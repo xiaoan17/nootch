@@ -1,0 +1,212 @@
+{
+  "amp": {
+    "buckets": [
+      {
+        "source": "amp",
+        "model": "claude-sonnet-4",
+        "project": "unknown",
+        "bucketStart": "2026-01-01T00:00:00.000Z",
+        "inputTokens": 107,
+        "outputTokens": 20,
+        "cachedInputTokens": 30,
+        "reasoningOutputTokens": 0,
+        "cacheCreation5mTokens": 0,
+        "cacheCreation1hTokens": 0,
+        "totalTokens": 127
+      }
+    ],
+    "sessions": [
+      {
+        "source": "amp",
+        "project": "unknown",
+        "sessionHash": "a7c2b70e79825527",
+        "firstMessageAt": "2026-01-01T00:00:05.000Z",
+        "lastMessageAt": "2026-01-01T00:00:05.000Z",
+        "durationSeconds": 0,
+        "activeSeconds": 0,
+        "messageCount": 2,
+        "userMessageCount": 1,
+        "userPromptHours": [
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    ],
+    "skipped": false
+  },
+  "dsh": {
+    "buckets": [
+      {
+        "source": "dsh",
+        "model": "deepseek-v4",
+        "project": "project",
+        "bucketStart": "2026-01-01T00:00:00.000Z",
+        "inputTokens": 110,
+        "outputTokens": 25,
+        "cachedInputTokens": 20,
+        "reasoningOutputTokens": 15,
+        "cacheCreation5mTokens": 0,
+        "cacheCreation1hTokens": 0,
+        "totalTokens": 150
+      }
+    ],
+    "sessions": [
+      {
+        "source": "dsh",
+        "project": "project",
+        "sessionHash": "cb5a157feb644bb0",
+        "firstMessageAt": "2026-01-01T00:00:00.000Z",
+        "lastMessageAt": "2026-01-01T00:00:05.000Z",
+        "durationSeconds": 5,
+        "activeSeconds": 0,
+        "messageCount": 2,
+        "userMessageCount": 1,
+        "userPromptHours": [
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    ],
+    "skipped": false
+  },
+  "cline": {
+    "buckets": [
+      {
+        "source": "cline",
+        "model": "claude",
+        "project": "project",
+        "bucketStart": "2026-01-01T00:00:00.000Z",
+        "inputTokens": 13,
+        "outputTokens": 20,
+        "cachedInputTokens": 5,
+        "reasoningOutputTokens": 0,
+        "cacheCreation5mTokens": 0,
+        "cacheCreation1hTokens": 0,
+        "totalTokens": 33
+      }
+    ],
+    "sessions": [
+      {
+        "source": "cline",
+        "project": "project",
+        "sessionHash": "0ebb429fa86d481c",
+        "firstMessageAt": "2026-01-01T00:00:00.000Z",
+        "lastMessageAt": "2026-01-01T00:00:05.000Z",
+        "durationSeconds": 5,
+        "activeSeconds": 0,
+        "messageCount": 2,
+        "userMessageCount": 1,
+        "userPromptHours": [
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    ],
+    "skipped": false
+  },
+  "kiro": {
+    "buckets": [
+      {
+        "source": "kiro",
+        "model": "claude",
+        "project": "project",
+        "bucketStart": "2026-01-01T00:00:00.000Z",
+        "inputTokens": 4,
+        "outputTokens": 2,
+        "cachedInputTokens": 9,
+        "reasoningOutputTokens": 2,
+        "cacheCreation5mTokens": 0,
+        "cacheCreation1hTokens": 0,
+        "totalTokens": 8
+      }
+    ],
+    "sessions": [],
+    "skipped": false
+  },
+  "cursor": {
+    "buckets": [
+      {
+        "source": "cursor",
+        "model": "model,fast",
+        "project": "unknown",
+        "hostname": "cursor-cloud",
+        "bucketStart": "2026-01-01T00:00:00.000Z",
+        "inputTokens": 1020,
+        "outputTokens": 10,
+        "cachedInputTokens": 50,
+        "reasoningOutputTokens": 0,
+        "cacheCreation5mTokens": 0,
+        "cacheCreation1hTokens": 0,
+        "totalTokens": 1030
+      }
+    ],
+    "sessions": [],
+    "skipped": false
+  }
+}

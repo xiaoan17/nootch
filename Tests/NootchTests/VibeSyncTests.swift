@@ -86,11 +86,13 @@ private func utcDateTime(_ string: String) -> Date {
 
 private func entry(
     source: String = "claude-code", model: String = "claude-opus-4-7", project: String = "proj",
-    timestamp: Date, input: Double = 1, output: Double = 2, cached: Double = 3, reasoning: Double = 0
+    timestamp: Date, input: Double = 1, output: Double = 2, cached: Double = 3, reasoning: Double = 0,
+    cacheCreation5m: Double = 0, cacheCreation1h: Double = 0
 ) -> VibeTokenEntry {
     VibeTokenEntry(
         source: source, model: model, project: project, timestamp: timestamp,
-        inputTokens: input, outputTokens: output, cachedInputTokens: cached, reasoningOutputTokens: reasoning)
+        inputTokens: input, outputTokens: output, cachedInputTokens: cached, reasoningOutputTokens: reasoning,
+        cacheCreation5mTokens: cacheCreation5m, cacheCreation1hTokens: cacheCreation1h)
 }
 
 private func event(
@@ -146,6 +148,52 @@ private func ingestJSON(buckets: Int, sessions: Int, unknownSources: [String] = 
     ], hostname: "Mac")
     #expect(buckets[0].totalTokens == 125)
     #expect(buckets[0].cachedInputTokens == 999)
+}
+
+// Cache writes stay inside totalTokens (they used to arrive folded into
+// inputTokens, and the server uses the field only as a `> 0` liveness
+// filter), but travel as their own TTL-split columns (upstream e9ae391).
+@Test func bucketAggregationCarriesCacheCreationSplit() {
+    let buckets = VibeAggregation.aggregateToBuckets([
+        entry(timestamp: utcDateTime("2026-09-06T08:05:00Z"), input: 10, output: 2, cached: 0,
+              reasoning: 0, cacheCreation5m: 0.4, cacheCreation1h: 0.4),
+        entry(timestamp: utcDateTime("2026-09-06T08:20:00Z"), input: 1, output: 1, cached: 0,
+              reasoning: 0, cacheCreation5m: 0.4, cacheCreation1h: 0.4),
+    ], hostname: "Mac")
+    #expect(buckets.count == 1)
+    #expect(buckets[0].inputTokens == 11)
+    #expect(buckets[0].cacheCreation5mTokens == 1) // sums first, then clamps
+    #expect(buckets[0].cacheCreation1hTokens == 1)
+    #expect(buckets[0].totalTokens == 11 + 3 + 1 + 1)
+}
+
+// A 5m<->1h reclassification must still re-upload: totalTokens alone cannot
+// see that move (upstream state.js bucketHash).
+@Test func bucketHashSeesTTLReclassification() {
+    func bucket(cacheCreation5m: Int, cacheCreation1h: Int) -> VibeBucket {
+        VibeBucket(
+            source: "claude-code", model: "m", project: "p", hostname: "Mac",
+            bucketStart: "2026-09-06T08:00:00.000Z",
+            inputTokens: 1, outputTokens: 2, cachedInputTokens: 3, reasoningOutputTokens: 0,
+            cacheCreation5mTokens: cacheCreation5m, cacheCreation1hTokens: cacheCreation1h,
+            totalTokens: 6 + cacheCreation5m + cacheCreation1h)
+    }
+    #expect(VibeSyncHashing.bucketHash(bucket(cacheCreation5m: 10, cacheCreation1h: 0))
+        != VibeSyncHashing.bucketHash(bucket(cacheCreation5m: 0, cacheCreation1h: 10)))
+}
+
+// Hiding project names re-folds buckets per hostname; the TTL split must
+// survive the round trip.
+@Test func reaggregateHiddenProjectsPreservesCacheCreationSplit() {
+    let buckets = VibeAggregation.aggregateToBuckets([
+        entry(project: "alpha", timestamp: utcDateTime("2026-09-06T08:05:00Z"), cacheCreation5m: 5),
+        entry(project: "beta", timestamp: utcDateTime("2026-09-06T08:10:00Z"), cacheCreation1h: 7),
+    ], hostname: "Mac").map { var bucket = $0; bucket.project = "unknown"; return bucket }
+    let refolded = VibeAggregation.reaggregateHiddenProjectBuckets(buckets)
+    #expect(refolded.count == 1)
+    #expect(refolded[0].cacheCreation5mTokens == 5)
+    #expect(refolded[0].cacheCreation1hTokens == 7)
+    #expect(refolded[0].totalTokens == buckets[0].totalTokens + buckets[1].totalTokens)
 }
 
 @Test func bucketAggregationSplitsByHalfHourAndTruncatesFields() {
@@ -232,11 +280,12 @@ private func ingestJSON(buckets: Int, sessions: Int, unknownSources: [String] = 
 // MARK: - Hashing compatibility with vibe-usage src/state.js
 
 @Test func bucketHashMatchesOfficialAlgorithm() {
-    // sha256("1\02\03\00\06") = 6f805790b23bf211… (computed with the official algorithm)
+    // sha256("1\02\03\00\06\00\00") = 9280a9278d8ef088… (official algorithm,
+    // including the cacheCreation5m/1h parts appended by upstream e9ae391)
     let bucket = VibeBucket(
         source: "x", model: "m", project: "p", hostname: "Mac", bucketStart: "2026-09-06T08:00:00.000Z",
         inputTokens: 1, outputTokens: 2, cachedInputTokens: 3, reasoningOutputTokens: 0, totalTokens: 6)
-    #expect(VibeSyncHashing.bucketHash(bucket) == "6f805790b23bf211")
+    #expect(VibeSyncHashing.bucketHash(bucket) == "9280a9278d8ef088")
 }
 
 @Test func sessionHashIsSha256PrefixOfSessionId() {
@@ -287,6 +336,136 @@ private func ingestJSON(buckets: Int, sessions: Int, unknownSources: [String] = 
     state.sessions["codex|hash"] = "fedcba9876543210"
     try store.save(state)
     #expect(store.load() == state)
+}
+
+// MARK: - State identity (re-bind → full re-upload, vibe-usage 4298e99)
+
+@Test func stateIdentityFingerprintsTheAPIKey() {
+    // sha256("vbu_account_a") = bce0efa33dbf9f31… — the raw key never appears.
+    let identity = VibeSyncStateIdentity(apiURL: "https://vibecafe.ai", apiKey: "vbu_account_a")
+    #expect(identity.apiUrl == "https://vibecafe.ai")
+    #expect(identity.keyFingerprint == "bce0efa33dbf9f31")
+    #expect(VibeSyncStateIdentity(apiURL: "https://vibecafe.ai", apiKey: "vbu_account_b") != identity)
+}
+
+@Test func stateWithSameIdentityRoundTrips() throws {
+    let directory = try makeTempDirectory()
+    let store = VibeSyncStateStore(fileURL: directory.appendingPathComponent("state.json"))
+    let identity = VibeSyncStateIdentity(apiURL: "https://vibecafe.ai", apiKey: "vbu_account_a")
+    var state = VibeSyncState()
+    state.buckets["codex|m|p|h|t"] = "hash1"
+    state.sessions["kiro|abc"] = "hash2"
+    state.identity = identity
+    try store.save(state)
+    let reloaded = store.load(identity: identity)
+    #expect(reloaded.buckets == ["codex|m|p|h|t": "hash1"])
+    #expect(reloaded.sessions == ["kiro|abc": "hash2"])
+    #expect(reloaded.identityChanged == false)
+}
+
+@Test func stateWithDifferentAPIKeyLoadsEmptyAndReportsRebind() throws {
+    let directory = try makeTempDirectory()
+    let store = VibeSyncStateStore(fileURL: directory.appendingPathComponent("state.json"))
+    var state = VibeSyncState()
+    state.buckets["codex|m|p|h|t"] = "hash1"
+    state.sessions["kiro|abc"] = "hash2"
+    state.identity = VibeSyncStateIdentity(apiURL: "https://vibecafe.ai", apiKey: "vbu_account_a")
+    try store.save(state)
+    let reloaded = store.load(identity: VibeSyncStateIdentity(apiURL: "https://vibecafe.ai", apiKey: "vbu_account_b"))
+    #expect(reloaded.buckets.isEmpty)
+    #expect(reloaded.sessions.isEmpty)
+    #expect(reloaded.identityChanged == true)
+}
+
+@Test func stateWithDifferentAPIURLLoadsEmptyEvenWithSameKey() throws {
+    let directory = try makeTempDirectory()
+    let store = VibeSyncStateStore(fileURL: directory.appendingPathComponent("state.json"))
+    var state = VibeSyncState()
+    state.buckets["codex|m|p|h|t"] = "hash1"
+    state.identity = VibeSyncStateIdentity(apiURL: "https://vibecafe.ai", apiKey: "vbu_account_a")
+    try store.save(state)
+    let reloaded = store.load(identity: VibeSyncStateIdentity(apiURL: "http://127.0.0.1:3000", apiKey: "vbu_account_a"))
+    #expect(reloaded.buckets.isEmpty)
+    #expect(reloaded.identityChanged == true)
+}
+
+// Migration choice (same as upstream): a file written before identities existed
+// is adopted as-is instead of forcing every installed client to re-upload its
+// whole history on upgrade day. The next save stamps the identity, which is
+// what catches a re-bind from then on.
+@Test func legacyStateFileWithoutIdentityIsAdopted() throws {
+    let directory = try makeTempDirectory()
+    let stateFile = directory.appendingPathComponent("state.json")
+    try Data(#"{"buckets":{"codex|m|p|h|t":"hash1"},"sessions":{"kiro|abc":"hash2"}}"#.utf8)
+        .write(to: stateFile)
+    let store = VibeSyncStateStore(fileURL: stateFile)
+    let accountA = VibeSyncStateIdentity(apiURL: "https://vibecafe.ai", apiKey: "vbu_account_a")
+    let legacy = store.load(identity: accountA)
+    #expect(legacy.buckets == ["codex|m|p|h|t": "hash1"])
+    #expect(legacy.sessions == ["kiro|abc": "hash2"])
+    #expect(legacy.identityChanged == false)
+
+    // The save stamps the identity; runtime-only signals are never persisted.
+    var stamped = legacy
+    stamped.identity = accountA
+    try store.save(stamped)
+    let onDisk = try #require(String(data: Data(contentsOf: stateFile), encoding: .utf8))
+    #expect(onDisk.contains(#""keyFingerprint":"bce0efa33dbf9f31""#))
+    #expect(onDisk.contains("identityChanged") == false)
+    // Now bound: the other account no longer inherits these hashes.
+    #expect(store.load(identity: VibeSyncStateIdentity(apiURL: "https://vibecafe.ai", apiKey: "vbu_account_b")).identityChanged == true)
+}
+
+@Test func stateFileNeverContainsTheRawAPIKey() throws {
+    let directory = try makeTempDirectory()
+    let stateFile = directory.appendingPathComponent("state.json")
+    let store = VibeSyncStateStore(fileURL: stateFile)
+    var state = VibeSyncState()
+    state.buckets["codex|m|p|h|t"] = "hash1"
+    state.identity = VibeSyncStateIdentity(apiURL: "https://vibecafe.ai", apiKey: "vbu_super_secret_key_value")
+    try store.save(state)
+    let text = try #require(String(data: Data(contentsOf: stateFile), encoding: .utf8))
+    #expect(text.contains("vbu_super_secret_key_value") == false)
+    #expect(text.range(of: #""keyFingerprint":"[0-9a-f]{16}""#, options: .regularExpression) != nil)
+}
+
+@Test func engineReuploadsFullHistoryAfterAPIKeyRebind() async throws {
+    let server = FakeServer()
+    var stateStore: VibeSyncStateStore?
+    let base = utcDate("2026-09-18T00:00:00.000Z")
+    let entries = (0..<3).map { index in
+        entry(model: "model-\(index)", timestamp: base, input: Double(index + 1), output: 0, cached: 0)
+    }
+    let parser = StubParser(source: "rebind-test", result: VibeParseResult(entries: entries))
+    let (engine, directory) = try await makeEngine(parsers: [parser], server: server, stateStore: &stateStore)
+
+    // First account: full upload, state records the target.
+    let first = await engine.sync()
+    #expect(first.status == .synced)
+    #expect(first.uploadedBuckets == 3)
+    var state = try #require(stateStore?.load())
+    #expect(state.buckets.count == 3)
+    #expect(state.identity?.apiUrl == "https://vibecafe.ai")
+    #expect(state.identity?.keyFingerprint.count == 16)
+    let firstFingerprint = state.identity?.keyFingerprint
+    let stateFileText = try #require(String(data: Data(contentsOf: directory.appendingPathComponent("state.json")), encoding: .utf8))
+    #expect(stateFileText.contains("vbu_test123") == false)
+
+    // Re-bind: the same local history must reach the new account in full.
+    _ = try writeConfig(#"{"apiKey":"vbu_account_b","hostname":"Mac"}"#, in: directory)
+    let second = await engine.sync()
+    #expect(second.status == .synced)
+    #expect(second.uploadedBuckets == 3)
+    state = try #require(stateStore?.load())
+    #expect(state.buckets.count == 3)
+    #expect(state.identity?.keyFingerprint != firstFingerprint)
+    #expect(state.identity?.keyFingerprint == "6bef5e1c6f47a2dd")
+
+    // Steady state on the new account: nothing left to send.
+    let third = await engine.sync()
+    #expect(third.status == .synced)
+    #expect(third.uploadedBuckets == 0)
+    #expect(server.posts.count == 2)
 }
 
 @Test func statePruneIsScopedToSuccessfulSources() {
@@ -743,7 +922,7 @@ private func makeEngine(
     _ = directory
 }
 
-@Test func engineDoesNotCommitBucketsWithUnknownSources() async throws {
+@Test func engineDoesNotCommitBucketsNorSessionsWithUnknownSources() async throws {
     let server = FakeServer(ingestUnknownSources: ["claude-code"])
     var stateStore: VibeSyncStateStore?
     let parser = StubParser(source: "claude-code", result: VibeParseResult(
@@ -754,9 +933,56 @@ private func makeEngine(
     let report = await engine.sync()
     #expect(report.status == .synced)
     let state = stateStore?.load()
-    // The rejected bucket stays uncommitted; the session still commits.
+    // The rejected bucket AND session both stay uncommitted, so the first sync
+    // after the server registers the source re-sends them instead of losing
+    // the session permanently.
     #expect(state?.buckets.isEmpty == true)
-    #expect(state?.sessions.count == 1)
+    #expect(state?.sessions.isEmpty == true)
+}
+
+@Test func engineResendsDroppedSourceBucketAndSessionOnceServerKnowsIt() async throws {
+    let dropUnknownSource = MutexBox(true)
+    let received = MutexBox<[(buckets: Int, sessions: Int)]>([])
+    let directory = try makeTempDirectory()
+    let configPath = try writeConfig(#"{"apiKey":"vbu_test123","hostname":"Mac"}"#, in: directory)
+    let dataLoader: @Sendable (URLRequest) async throws -> (Data, URLResponse) = { request in
+        if request.url?.path == "/api/usage/settings" {
+            return (Data(settingsTrueJSON.utf8), httpResponse(request.url!, status: 200))
+        }
+        let body = try inflateGzip(request.httpBody ?? Data())
+        let json = try JSONSerialization.jsonObject(with: body) as? [String: Any] ?? [:]
+        let bucketCount = (json["buckets"] as? [[String: Any]])?.count ?? 0
+        let sessionCount = (json["sessions"] as? [[String: Any]])?.count ?? 0
+        received.withValue { $0.append((bucketCount, sessionCount)) }
+        let dropping = dropUnknownSource.withValue { $0 }
+        let response = dropping
+            ? #"{"ingested":0,"sessions":0,"dropped":{"buckets":1,"unknownSources":["devin"]}}"#
+            : ingestJSON(buckets: bucketCount, sessions: sessionCount)
+        return (Data(response.utf8), httpResponse(request.url!, status: 200))
+    }
+    let t0 = utcDate("2026-09-16T00:00:00.000Z")
+    let parser = StubParser(source: "devin", result: VibeParseResult(
+        entries: [entry(source: "devin", timestamp: t0, input: 1, output: 2, cached: 0)],
+        events: [event("abc", source: "devin", t0, role: .user)]))
+    let engine = VibeSyncEngine(
+        parsers: [parser], configPath: configPath,
+        dataLoader: dataLoader, sleep: { _ in }, random: { 0.5 })
+    let stateStore = VibeSyncStateStore(fileURL: directory.appendingPathComponent("state.json"))
+
+    // First sync: the backend soft-drops the unknown source — nothing commits.
+    let first = await engine.sync()
+    #expect(first.status == .synced)
+    #expect(stateStore.load().buckets.isEmpty)
+    #expect(stateStore.load().sessions.isEmpty)
+
+    // After the backend learns the source, the next sync re-sends and commits.
+    dropUnknownSource.withValue { $0 = false }
+    let second = await engine.sync()
+    #expect(second.status == .synced)
+    #expect(stateStore.load().buckets.count == 1)
+    #expect(stateStore.load().sessions.count == 1)
+
+    #expect(received.withValue { $0.map { [$0.buckets, $0.sessions] } } == [[1, 1], [1, 1]])
 }
 
 @Test func engineFailedBatchLeavesUncommittedSuffixForNextSync() async throws {

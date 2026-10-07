@@ -1,0 +1,31 @@
+{
+  "id": "T-golden",
+  "created": "2026-01-01T00:00:00.000Z",
+  "messages": [
+    {
+      "role": "user"
+    },
+    {
+      "role": "assistant",
+      "usage": {
+        "inputTokens": 999,
+        "cacheReadInputTokens": 30,
+        "cacheCreationInputTokens": 7
+      }
+    }
+  ],
+  "usageLedger": {
+    "events": [
+      {
+        "timestamp": "2026-01-01T00:00:05.000Z",
+        "fromMessageId": 0,
+        "toMessageId": 1,
+        "model": "claude-sonnet-4",
+        "tokens": {
+          "input": 100,
+          "output": 20
+        }
+      }
+    ]
+  }
+}
